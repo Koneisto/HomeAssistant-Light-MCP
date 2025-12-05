@@ -1,0 +1,24 @@
+# Config files with secrets
+config.json
+dist/config.json
+
+# Source files (only dist is needed)
+src/
+
+# Development files
+tsconfig.json
+.gitignore
+
+# Local data
+scenes.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
