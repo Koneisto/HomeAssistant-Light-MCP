@@ -1,0 +1,41 @@
+{
+  "name": "ha-mcp-server",
+  "version": "0.6.10",
+  "mcpName": "io.github.Koneisto/HomeAssistant-Light-MCP",
+  "description": "MCP server for controlling Home Assistant lights and managing scenes. Lights only by design for safety.",
+  "main": "dist/index.js",
+  "bin": {
+    "ha-mcp-server": "dist/index.js"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "home-assistant",
+    "lights",
+    "scenes",
+    "smart-home",
+    "model-context-protocol"
+  ],
+  "author": "Koneisto",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Koneisto/HomeAssistant-Light-MCP.git"
+  },
+  "homepage": "https://github.com/Koneisto/HomeAssistant-Light-MCP",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  }
+}

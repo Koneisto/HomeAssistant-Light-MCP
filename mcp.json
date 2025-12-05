@@ -1,0 +1,16 @@
+{
+  "name": "ha-mcp-server",
+  "version": "0.6.0",
+  "description": "Home Assistant Light & Scene Control",
+  "tools": [
+    "scene_show_lights",
+    "scene_adjust_light",
+    "scene_create",
+    "scene_list",
+    "scene_activate",
+    "scene_update",
+    "scene_delete",
+    "scene_blackout",
+    "scene_configure"
+  ]
+}
