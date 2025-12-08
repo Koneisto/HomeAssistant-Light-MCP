@@ -1,6 +1,11 @@
 # Home Assistant Light MCP
 
+[![npm version](https://img.shields.io/npm/v/ha-mcp-server.svg)](https://www.npmjs.com/package/ha-mcp-server)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Model Context Protocol (MCP) server for controlling Home Assistant lights and managing scenes. Complements the official Home Assistant MCP by providing detailed light control with colors and scene management.
+
+> **Like this project?** Give it a ⭐ on GitHub and help others discover it!
 
 ## Design Philosophy: Lights Only
 
@@ -69,6 +74,26 @@ Edit config file:
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
+**Option 1: Using npx (recommended, no global install needed)**
+```json
+{
+  "mcpServers": {
+    "ha-light-scenes": {
+      "command": "npx",
+      "args": ["-y", "ha-mcp-server"],
+      "env": {
+        "HA_URL": "http://your-home-assistant-ip:8123",
+        "HA_TOKEN": "your-long-lived-access-token"
+      }
+    }
+  }
+}
+```
+
+**Option 2: Global install**
+```bash
+npm install -g ha-mcp-server
+```
 ```json
 {
   "mcpServers": {
@@ -138,6 +163,8 @@ The same configuration structure works with any MCP-compatible client.
 | `scene_update` | Update existing scene with current lights |
 | `scene_delete` | Delete a scene |
 | `scene_blackout` | Turn off all lights (supports exclusions) |
+| `scene_diagnose` | Diagnose lights and scenes, check connectivity |
+| `scene_fix` | Fix scene problems, restore from backup |
 | `scene_configure` | Set Home Assistant URL and token |
 
 ### Light Properties
@@ -157,6 +184,38 @@ The same configuration structure works with any MCP-compatible client.
 
 - **Exclusive**: Turns off all lights not in the scene. Good for room-specific scenes.
 - **Additive**: Only affects lights in the scene. Good for accent lighting.
+
+## Local Backup & Multi-Instance Support
+
+This MCP maintains a local backup of scenes you create:
+- **Automatic backup**: Scenes are saved to `~/.config/ha-mcp-server/scenes-backup.json`
+- **Multi-instance aware**: Detects when another MCP instance (or HA UI) modifies scenes
+- **Smart conflict resolution**: Merges changes from multiple sources
+- **Restore capability**: Can restore scenes if Home Assistant loses them
+
+### Diagnostics (`scene_diagnose`)
+
+Analyzes your lights and scenes to identify problems:
+- Tests light connectivity and response times
+- Detects connection types (Zigbee, WiFi, Bluetooth)
+- Finds scenes with null values or missing lights
+- Compares Home Assistant state with local backup
+- Reports new lights not yet in exclusive scenes
+
+Example: *"Run diagnostics on my lights"*
+
+### Fix & Repair (`scene_fix`)
+
+Four actions to repair scene problems:
+
+| Action | Description |
+|--------|-------------|
+| `fix_all` | Auto-fix all scenes: remove null values, add missing lights to exclusive scenes |
+| `fix_scene` | Fix a specific scene by name |
+| `test_scene` | Activate a scene and report what went wrong |
+| `restore_from_backup` | Restore scenes from local backup if Home Assistant lost them |
+
+Example: *"Fix all my scenes"* or *"Restore Evening Lights from backup"*
 
 ## IKEA Tradfri Support
 
@@ -192,9 +251,13 @@ Without these fixes, Tradfri lights often ignore commands or produce incorrect c
 - Cannot access other Home Assistant entities (sensors, locks, cameras, etc.)
 - Cannot make changes outside of light control and scene management
 
+## Contributing
+
+Found a bug or have an idea? [Open an issue](https://github.com/Koneisto/HomeAssistant-Light-MCP/issues) or submit a pull request!
+
 ## License
 
-MIT
+MIT - Use freely, attribution appreciated but not required.
 
 ## Author
 
