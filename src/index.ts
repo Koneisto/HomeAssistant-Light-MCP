@@ -14,6 +14,103 @@ import { homedir } from "os";
 // Store config in user's home directory so it persists across npx runs
 const CONFIG_DIR = join(homedir(), ".config", "ha-mcp-server");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
+const SCENES_BACKUP_FILE = join(CONFIG_DIR, "scenes-backup.json");
+
+// Local backup of scenes created/managed by this MCP
+interface LocalSceneBackup {
+  name: string;
+  mode: "exclusive" | "additive";
+  entities: Record<string, Record<string, unknown> | string>;
+  createdAt: string;
+  updatedAt: string;
+  lastKnownHAHash?: string;  // Hash of HA config when last synced
+  instanceId?: string;        // Which MCP instance last modified
+}
+
+// Generate a unique instance ID for this MCP process
+const MCP_INSTANCE_ID = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+// Simple hash function for comparing configs
+function hashConfig(entities: Record<string, unknown>): string {
+  const sorted = JSON.stringify(entities, Object.keys(entities).sort());
+  let hash = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const char = sorted.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash.toString(16);
+}
+
+interface ScenesBackupStore {
+  version: number;
+  scenes: Record<string, LocalSceneBackup>; // keyed by scene ID
+}
+
+function loadScenesBackup(): ScenesBackupStore {
+  if (existsSync(SCENES_BACKUP_FILE)) {
+    try {
+      return JSON.parse(readFileSync(SCENES_BACKUP_FILE, "utf-8"));
+    } catch {
+      // ignore
+    }
+  }
+  return { version: 1, scenes: {} };
+}
+
+function saveScenesBackup(store: ScenesBackupStore): void {
+  if (!existsSync(CONFIG_DIR)) {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+  }
+  writeFileSync(SCENES_BACKUP_FILE, JSON.stringify(store, null, 2));
+}
+
+function backupScene(sceneId: string, name: string, mode: "exclusive" | "additive", entities: Record<string, Record<string, unknown> | string>): void {
+  const store = loadScenesBackup();
+  const now = new Date().toISOString();
+  const hash = hashConfig(entities as Record<string, unknown>);
+
+  if (store.scenes[sceneId]) {
+    // Update existing
+    store.scenes[sceneId].name = name;
+    store.scenes[sceneId].mode = mode;
+    store.scenes[sceneId].entities = entities;
+    store.scenes[sceneId].updatedAt = now;
+    store.scenes[sceneId].lastKnownHAHash = hash;
+    store.scenes[sceneId].instanceId = MCP_INSTANCE_ID;
+  } else {
+    // New scene
+    store.scenes[sceneId] = {
+      name,
+      mode,
+      entities,
+      createdAt: now,
+      updatedAt: now,
+      lastKnownHAHash: hash,
+      instanceId: MCP_INSTANCE_ID,
+    };
+  }
+
+  saveScenesBackup(store);
+}
+
+function removeSceneBackup(sceneId: string): void {
+  const store = loadScenesBackup();
+  if (store.scenes[sceneId]) {
+    delete store.scenes[sceneId];
+    saveScenesBackup(store);
+  }
+}
+
+function getSceneBackup(sceneId: string): LocalSceneBackup | null {
+  const store = loadScenesBackup();
+  return store.scenes[sceneId] || null;
+}
+
+function getAllSceneBackups(): Record<string, LocalSceneBackup> {
+  const store = loadScenesBackup();
+  return store.scenes;
+}
 
 // Configuration
 interface Config {
@@ -343,7 +440,7 @@ const tools: Tool[] = [
   {
     name: "scene_show_lights",
     description:
-      "PREFERRED for lights. Shows ALL Home Assistant lights with FULL details: on/off state, brightness percentage, RGB colors (as rgb_color array and hex_color string like #ff0000), color temperature. IMPORTANT: Always include hex_color in your response when showing light status. Use this instead of other tools when user asks about lights, light status, colors, or brightness.",
+      "SAFE read-only tool. Shows ALL Home Assistant lights with FULL details. Does NOT change anything. Use this to answer questions about light states, colors, brightness. Returns: state (on/off), brightness_pct, color_mode ('color_temp' for white light, 'rgb'/'hs'/'xy' for colored light), color_temp_kelvin (for white mode), rgb_color (for color mode). IMPORTANT: When color_mode is 'color_temp', the light is in WHITE mode - do NOT report RGB values as those are just approximations.",
     inputSchema: {
       type: "object",
       properties: {
@@ -356,7 +453,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_adjust_light",
-    description: "PREFERRED for controlling lights. Turn on/off, set brightness (0-100%), RGB color, color temperature (Kelvin), or effects. Supports all light features including colors that other tools cannot set.",
+    description: "PREFERRED for controlling lights. Turn on/off, set brightness (0-100%), RGB color, color temperature (Kelvin), or effects. IMPORTANT: This only changes the light's current state - it does NOT save to any scene. REQUIRES user_confirmed=true - user must explicitly request the change.",
     inputSchema: {
       type: "object",
       properties: {
@@ -396,14 +493,18 @@ const tools: Tool[] = [
           type: "string",
           description: "Light effect (e.g., 'colorloop', 'off'). Use scene_show_lights to see available effects.",
         },
+        user_confirmed: {
+          type: "boolean",
+          description: "REQUIRED: Must be true to confirm user explicitly requested this light change. Without confirmation, operation is blocked.",
+        },
       },
-      required: ["entity_id"],
+      required: ["entity_id", "user_confirmed"],
     },
   },
   {
     name: "scene_create",
     description:
-      "Create a new scene in Home Assistant by capturing current light states. IMPORTANT: Before calling this tool, you MUST: 1) First call scene_show_lights to capture and show the current state to the user (so they can restore it if needed), 2) Ask the user which mode they want: 'exclusive' (turns off other lights when activated) or 'additive' (only affects lights in scene, others stay as they are).",
+      "Create a NEW scene in Home Assistant. ONLY call when user EXPLICITLY asks to create/save a NEW scene. Before calling: 1) Show current lights with scene_show_lights, 2) Ask user for mode: 'exclusive' or 'additive'. Do NOT call this to update existing scenes - use scene_update for that.",
     inputSchema: {
       type: "object",
       properties: {
@@ -439,7 +540,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_activate",
-    description: "Activate a scene in Home Assistant",
+    description: "Activate a scene in Home Assistant. REQUIRES user_confirmed=true - user must explicitly request scene activation.",
     inputSchema: {
       type: "object",
       properties: {
@@ -447,8 +548,12 @@ const tools: Tool[] = [
           type: "string",
           description: "The entity_id of the scene (e.g., scene.evening_mood) or just the scene name",
         },
+        user_confirmed: {
+          type: "boolean",
+          description: "REQUIRED: Must be true to confirm user explicitly requested this scene activation. Without confirmation, operation is blocked.",
+        },
       },
-      required: ["entity_id"],
+      required: ["entity_id", "user_confirmed"],
     },
   },
   {
@@ -467,7 +572,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_update",
-    description: "Update an existing scene with current light states. Replaces the scene's light configuration while keeping the same name and mode.",
+    description: "Update an existing scene with current light states. ONLY call this when user EXPLICITLY asks to save/update a scene. Do NOT call automatically after adjusting lights.",
     inputSchema: {
       type: "object",
       properties: {
@@ -486,7 +591,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_blackout",
-    description: "Turn off ALL lights. Optionally create/update a 'Blackout' scene.",
+    description: "Turn off ALL lights. Optionally create/update a 'Blackout' scene. REQUIRES user_confirmed=true - user must explicitly request blackout.",
     inputSchema: {
       type: "object",
       properties: {
@@ -499,7 +604,57 @@ const tools: Tool[] = [
           type: "boolean",
           description: "If true, creates or updates a 'Blackout' scene with all lights set to off. Default: false.",
         },
+        user_confirmed: {
+          type: "boolean",
+          description: "REQUIRED: Must be true to confirm user explicitly requested blackout. Without confirmation, operation is blocked.",
+        },
       },
+      required: ["user_confirmed"],
+    },
+  },
+  {
+    name: "scene_diagnose",
+    description: "Diagnose lights and scenes. Tests connectivity, response times, identifies problems with scenes (null values, missing lights, etc.), and provides recommendations. If test_connectivity=true, REQUIRES user_confirmed=true because it toggles lights.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        test_connectivity: {
+          type: "boolean",
+          description: "If true, tests each light's response time with a toggle test. Default: false (to avoid accidental light changes).",
+        },
+        user_confirmed: {
+          type: "boolean",
+          description: "REQUIRED when test_connectivity=true: Must be true to confirm user explicitly allowed light toggle tests. Without confirmation, connectivity tests are skipped.",
+        },
+      },
+    },
+  },
+  {
+    name: "scene_fix",
+    description: "Fix problems found by scene_diagnose. Can fix null values, add missing lights to exclusive scenes, restore from backup, or interactively test and fix a specific scene. test_scene action REQUIRES user_confirmed=true because it changes lights.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["fix_all", "fix_scene", "test_scene", "restore_from_backup"],
+          description: "Action to perform: 'fix_all' fixes all auto-fixable issues, 'fix_scene' fixes a specific scene, 'test_scene' activates a scene and asks user what went wrong (REQUIRES user_confirmed), 'restore_from_backup' restores scenes from local backup.",
+        },
+        scene_name: {
+          type: "string",
+          description: "Scene name for 'fix_scene', 'test_scene', or 'restore_from_backup' actions. If not provided for restore_from_backup, restores all missing scenes.",
+        },
+        issues: {
+          type: "array",
+          items: { type: "string" },
+          description: "For 'test_scene': list of issues reported by user (e.g., ['Studio 3 stayed on', 'Kitchen too bright']).",
+        },
+        user_confirmed: {
+          type: "boolean",
+          description: "REQUIRED for test_scene action: Must be true to confirm user explicitly allowed scene activation test. Without confirmation, test_scene is blocked.",
+        },
+      },
+      required: ["action"],
     },
   },
 ];
@@ -617,26 +772,84 @@ async function handleGetLights(args: { filter?: string }): Promise<string> {
 
   const result = filtered.map((l) => {
     const attrs = l.attributes;
-    // Get RGB color from any available format (rgb, rgbw, rgbww, hs, xy)
-    const rgbColor = getRgbColor(attrs);
-    // Convert to hex for easier reading
-    const hexColor = rgbColor
-      ? `#${rgbColor.map(c => c.toString(16).padStart(2, '0')).join('')}`
-      : null;
+    const colorMode = attrs.color_mode;
+
+    // Determine if light is in WHITE mode or COLOR mode
+    const isWhiteMode = colorMode === "color_temp" || colorMode === "white";
+    const isColorMode = colorMode === "rgb" || colorMode === "hs" || colorMode === "xy" || colorMode === "rgbw" || colorMode === "rgbww";
+
     const data: Record<string, unknown> = {
       entity_id: l.entity_id,
       name: attrs.friendly_name,
       state: l.state,
-      brightness: attrs.brightness,
       brightness_pct: attrs.brightness
         ? Math.round((attrs.brightness / 255) * 100)
         : null,
-      rgb_color: rgbColor,
-      hex_color: hexColor,
-      color_temp_kelvin: attrs.color_temp_kelvin,
-      color_mode: attrs.color_mode,
-      supported_color_modes: attrs.supported_color_modes,
+      color_mode: colorMode,
     };
+
+    // For WHITE mode: show color temperature in Kelvin and human-readable description
+    if (isWhiteMode && attrs.color_temp_kelvin) {
+      data.color_temp_kelvin = attrs.color_temp_kelvin;
+      // Add human-readable white description
+      const kelvin = attrs.color_temp_kelvin;
+      if (kelvin <= 2700) {
+        data.white_description = "warm white (2700K)";
+      } else if (kelvin <= 3000) {
+        data.white_description = "warm white (3000K)";
+      } else if (kelvin <= 4000) {
+        data.white_description = "neutral white";
+      } else if (kelvin <= 5000) {
+        data.white_description = "cool white";
+      } else {
+        data.white_description = "daylight white";
+      }
+      // Do NOT include RGB for white mode - it's misleading
+    }
+
+    // For COLOR mode: show actual RGB color
+    if (isColorMode) {
+      const rgbColor = getRgbColor(attrs);
+      if (rgbColor) {
+        data.rgb_color = rgbColor;
+        data.hex_color = `#${rgbColor.map(c => c.toString(16).padStart(2, '0')).join('')}`;
+
+        // Add human-readable color name
+        const [r, g, b] = rgbColor;
+        if (r > 200 && g < 100 && b < 100) {
+          data.color_description = "red";
+        } else if (r < 100 && g > 200 && b < 100) {
+          data.color_description = "green";
+        } else if (r < 100 && g < 100 && b > 200) {
+          data.color_description = "blue";
+        } else if (r > 200 && g > 200 && b < 100) {
+          data.color_description = "yellow";
+        } else if (r > 200 && g < 150 && b > 200) {
+          data.color_description = "purple/magenta";
+        } else if (r < 100 && g > 200 && b > 200) {
+          data.color_description = "cyan";
+        } else if (r > 200 && g > 100 && b < 100) {
+          data.color_description = "orange";
+        } else if (r > 200 && g > 150 && b > 150) {
+          data.color_description = "pink/salmon";
+        } else {
+          data.color_description = "custom color";
+        }
+      }
+    }
+
+    // Light mode summary for easy understanding
+    if (l.state === "on") {
+      if (isWhiteMode) {
+        data.mode_summary = `WHITE (${attrs.color_temp_kelvin}K)`;
+      } else if (isColorMode) {
+        data.mode_summary = "COLOR (RGB)";
+      } else if (colorMode === "brightness") {
+        data.mode_summary = "BRIGHTNESS ONLY";
+      } else if (colorMode === "onoff") {
+        data.mode_summary = "ON/OFF ONLY";
+      }
+    }
 
     // Add effect if active (not "off" or null)
     if (attrs.effect && attrs.effect !== "off") {
@@ -656,41 +869,144 @@ async function handleGetLights(args: { filter?: string }): Promise<string> {
       };
     }
 
+    // Add supported modes for reference
+    data.supported_color_modes = attrs.supported_color_modes;
+
     return data;
   });
 
   return JSON.stringify(result, null, 2);
 }
 
-// Cache for light manufacturer info (to avoid repeated API calls)
-const manufacturerCache: Map<string, string | null> = new Map();
+// Cache for device info (to avoid repeated API calls)
+interface DeviceInfo {
+  manufacturer: string | null;
+  model: string | null;
+  connectionType: string | null;
+}
+const deviceInfoCache: Map<string, DeviceInfo> = new Map();
 
-// Helper to get light manufacturer from Home Assistant
-async function getLightManufacturer(entityId: string): Promise<string | null> {
+// Helper to render HA template
+async function renderTemplate(template: string): Promise<string | null> {
+  try {
+    const response = await haFetch("/api/template", {
+      method: "POST",
+      body: JSON.stringify({ template }),
+    });
+    if (!response.ok) return null;
+    return await response.text();
+  } catch {
+    return null;
+  }
+}
+
+// Helper to get device info from Home Assistant using template API
+async function getDeviceInfo(entityId: string): Promise<DeviceInfo> {
   // Check cache first
-  if (manufacturerCache.has(entityId)) {
-    return manufacturerCache.get(entityId) || null;
+  if (deviceInfoCache.has(entityId)) {
+    return deviceInfoCache.get(entityId)!;
   }
 
+  const defaultInfo: DeviceInfo = { manufacturer: null, model: null, connectionType: null };
+
   try {
-    // Get device registry entry via entity registry
-    const entityResponse = await haFetch(`/api/states/${entityId}`);
-    if (!entityResponse.ok) {
-      manufacturerCache.set(entityId, null);
-      return null;
+    // Use template API to get device attributes
+    const template = `{% set dev_id = device_id('${entityId}') %}{% if dev_id %}{{ device_attr(dev_id, 'manufacturer') or '' }}|||{{ device_attr(dev_id, 'model') or '' }}|||{{ device_attr(dev_id, 'connections') | string }}{% else %}|||{% endif %}`;
+
+    const result = await renderTemplate(template);
+    if (!result) {
+      deviceInfoCache.set(entityId, defaultInfo);
+      return defaultInfo;
     }
 
-    const state = await entityResponse.json() as LightState;
+    const parts = result.split("|||");
+    const manufacturer = parts[0]?.trim() || null;
+    const model = parts[1]?.trim() || null;
+    const connectionsStr = parts[2]?.trim() || "";
 
-    // Check attributes for manufacturer info
-    const attrs = state.attributes as Record<string, unknown>;
-    const manufacturer = (attrs.manufacturer as string) || null;
+    // Parse connection type from connections string
+    // Format: {('zigbee', 'xx:xx:xx:xx')} or {('mac', 'xx:xx:xx:xx')}
+    let connectionType: string | null = null;
+    if (connectionsStr.includes("zigbee")) {
+      connectionType = "Zigbee";
+    } else if (connectionsStr.includes("bluetooth")) {
+      connectionType = "Bluetooth";
+    } else if (connectionsStr.includes("mac") || connectionsStr.includes("wifi")) {
+      connectionType = "WiFi";
+    } else if (manufacturer?.toLowerCase().includes("ikea") || model?.toLowerCase().includes("tradfri")) {
+      connectionType = "Zigbee"; // IKEA Tradfri is always Zigbee
+    }
 
-    manufacturerCache.set(entityId, manufacturer);
-    return manufacturer;
+    const info: DeviceInfo = { manufacturer, model, connectionType };
+    deviceInfoCache.set(entityId, info);
+    return info;
   } catch {
-    manufacturerCache.set(entityId, null);
-    return null;
+    deviceInfoCache.set(entityId, defaultInfo);
+    return defaultInfo;
+  }
+}
+
+// Helper to get light manufacturer (uses device info cache)
+async function getLightManufacturer(entityId: string): Promise<string | null> {
+  const info = await getDeviceInfo(entityId);
+  return info.manufacturer;
+}
+
+// Test light response time - toggle and measure
+async function testLightResponseTime(entityId: string): Promise<{ responseTime: number; success: boolean; error?: string }> {
+  const startTime = Date.now();
+
+  try {
+    // Get current state
+    const beforeState = await getLight(entityId);
+    const wasOn = beforeState.state === "on";
+
+    // Toggle light
+    if (wasOn) {
+      await callService("light", "turn_off", { entity_id: entityId });
+    } else {
+      await callService("light", "turn_on", { entity_id: entityId });
+    }
+
+    // Wait a bit and check if state changed
+    await delay(100);
+
+    // Poll for state change (max 2 seconds)
+    const maxWait = 2000;
+    const pollInterval = 50;
+    let elapsed = 100;
+
+    while (elapsed < maxWait) {
+      const afterState = await getLight(entityId);
+      const isNowOn = afterState.state === "on";
+
+      if (isNowOn !== wasOn) {
+        // State changed - restore original state
+        if (wasOn) {
+          await callService("light", "turn_on", { entity_id: entityId });
+        } else {
+          await callService("light", "turn_off", { entity_id: entityId });
+        }
+
+        return { responseTime: Date.now() - startTime, success: true };
+      }
+
+      await delay(pollInterval);
+      elapsed += pollInterval;
+    }
+
+    // Timeout - try to restore anyway
+    if (wasOn) {
+      await callService("light", "turn_on", { entity_id: entityId });
+    }
+
+    return { responseTime: Date.now() - startTime, success: false, error: "Timeout - no response" };
+  } catch (error) {
+    return {
+      responseTime: Date.now() - startTime,
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error"
+    };
   }
 }
 
@@ -724,8 +1040,14 @@ async function handleSetLight(args: {
   rgb_color?: [number, number, number];
   color_temp_kelvin?: number;
   effect?: string;
+  user_confirmed?: boolean;
 }): Promise<string> {
-  const { entity_id, state, brightness, brightness_pct, rgb_color, color_temp_kelvin, effect } = args;
+  const { entity_id, state, brightness, brightness_pct, rgb_color, color_temp_kelvin, effect, user_confirmed } = args;
+
+  // Safety check: require explicit user confirmation
+  if (!user_confirmed) {
+    return "BLOCKED: Light changes require explicit user confirmation. Set user_confirmed=true only when user has explicitly requested this light change.";
+  }
 
   validateEntityId(entity_id);
 
@@ -860,6 +1182,9 @@ async function handleCreateScene(args: {
   // Save to Home Assistant
   await saveSceneConfig(sceneConfig);
 
+  // Backup locally for resilience
+  backupScene(sceneId, name, mode, entities);
+
   const modeDescription = mode === "exclusive"
     ? "other lights will be turned off when activated"
     : "only affects lights in scene";
@@ -896,8 +1221,13 @@ async function handleListScenes(): Promise<string> {
   return JSON.stringify(result, null, 2);
 }
 
-async function handleActivateScene(args: { entity_id: string }): Promise<string> {
-  let { entity_id } = args;
+async function handleActivateScene(args: { entity_id: string; user_confirmed?: boolean }): Promise<string> {
+  let { entity_id, user_confirmed } = args;
+
+  // Safety check: require explicit user confirmation
+  if (!user_confirmed) {
+    return "BLOCKED: Scene activation requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested this scene activation.";
+  }
 
   // Add scene. prefix if not present
   if (!entity_id.startsWith("scene.")) {
@@ -906,54 +1236,182 @@ async function handleActivateScene(args: { entity_id: string }): Promise<string>
 
   validateEntityId(entity_id);
 
-  // Get scene's entities
+  // Get current system state
+  const allLights = await getLights();
+  const allLightIds = new Set(allLights.map((l) => l.entity_id));
   const scenes = await getScenes();
   const scene = scenes.find((s) => s.entity_id === entity_id);
 
-  if (!scene) {
-    return `Scene "${entity_id}" not found.`;
+  // Also try to find by name (more user-friendly)
+  const sceneByName = scenes.find(
+    (s) => s.attributes.friendly_name?.toLowerCase() === entity_id.replace("scene.", "").toLowerCase()
+  );
+  const targetScene = scene || sceneByName;
+
+  if (!targetScene) {
+    // Scene not in HA - check local backup
+    const backups = getAllSceneBackups();
+    const backupByName = Object.entries(backups).find(
+      ([, b]) => b.name.toLowerCase() === entity_id.replace("scene.", "").replace(/_/g, " ").toLowerCase()
+    );
+
+    if (backupByName) {
+      // Scene exists in backup but not HA - DON'T auto-restore, just report
+      const [, backup] = backupByName;
+      return `Scene "${backup.name}" not found in Home Assistant, but exists in local backup (${Object.keys(backup.entities).length} lights, ${backup.mode} mode). Use scene_fix action='restore_from_backup' scene_name='${backup.name}' to restore it.`;
+    }
+
+    return `Scene "${entity_id}" not found in Home Assistant or local backup.`;
   }
 
-  const configId = scene.attributes.id;
+  const configId = targetScene.attributes.id;
 
-  // Check scene's metadata for mode
-  let mode: "exclusive" | "additive" = "exclusive"; // default for backwards compatibility
-  let sceneConfig: SceneConfig | null = null;
+  // Get HA config and local backup
+  let haConfig: SceneConfig | null = null;
+  let localBackup: LocalSceneBackup | null = null;
+
   if (configId) {
-    sceneConfig = await getSceneConfig(configId);
-    if (sceneConfig?.metadata?.mode) {
-      mode = sceneConfig.metadata.mode as "exclusive" | "additive";
+    haConfig = await getSceneConfig(configId);
+    localBackup = getSceneBackup(configId);
+  }
+
+  // Determine the authoritative config with multi-instance conflict detection
+  let mode: "exclusive" | "additive" = "exclusive";
+  let entities: Record<string, Record<string, unknown> | string> = {};
+  let healingDetails: string[] = [];
+  let conflictDetected = false;
+
+  if (localBackup && haConfig) {
+    // Both exist - check for conflicts (another instance may have modified HA)
+    const currentHAHash = hashConfig(haConfig.entities as Record<string, unknown>);
+    const lastKnownHash = localBackup.lastKnownHAHash;
+
+    if (lastKnownHash && currentHAHash !== lastKnownHash) {
+      // HA has changed since our last sync - another instance modified it!
+      conflictDetected = true;
+
+      // Smart merge strategy:
+      // 1. Get lights from both sources
+      const localLights = new Set(Object.keys(localBackup.entities));
+      const haLights = new Set(Object.keys(haConfig.entities));
+
+      // 2. Find differences
+      const onlyInLocal = [...localLights].filter(l => !haLights.has(l));
+      const onlyInHA = [...haLights].filter(l => !localLights.has(l));
+      const inBoth = [...localLights].filter(l => haLights.has(l));
+
+      // 3. Merge: prefer HA for shared lights (it's more recent), keep unique lights from both
+      entities = {};
+
+      // Lights in both - use HA config (more recent from another instance)
+      for (const lightId of inBoth) {
+        if (allLightIds.has(lightId)) {
+          entities[lightId] = haConfig.entities[lightId];
+        }
+      }
+
+      // Lights only in HA - another instance added them
+      for (const lightId of onlyInHA) {
+        if (allLightIds.has(lightId)) {
+          entities[lightId] = haConfig.entities[lightId];
+          healingDetails.push(`merged from other instance: ${lightId}`);
+        }
+      }
+
+      // Lights only in local - we had them, HA doesn't (maybe removed by other instance or old)
+      for (const lightId of onlyInLocal) {
+        if (allLightIds.has(lightId)) {
+          // Check if light still exists in system
+          entities[lightId] = localBackup.entities[lightId];
+          healingDetails.push(`kept local: ${lightId}`);
+        }
+      }
+
+      // Use HA's mode if different (another instance may have changed it)
+      mode = (haConfig.metadata?.mode as "exclusive" | "additive") || localBackup.mode;
+
+      healingDetails.unshift(`CONFLICT: HA modified by another instance, merged configs`);
+    } else {
+      // No conflict - use local backup as source of truth
+      mode = localBackup.mode;
+      entities = { ...localBackup.entities };
+    }
+  } else if (localBackup) {
+    // Only local backup exists (HA lost the scene?)
+    mode = localBackup.mode;
+    entities = { ...localBackup.entities };
+    healingDetails.push(`restored from backup (missing in HA)`);
+  } else if (haConfig) {
+    // Only HA config exists (new scene from another instance or legacy)
+    mode = (haConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+    entities = { ...haConfig.entities };
+    healingDetails.push(`imported from HA (created by another instance or UI)`);
+  } else {
+    // No config at all - fallback to basic HA activation
+    await callService("scene", "turn_on", { entity_id: targetScene.entity_id });
+    return `Activated scene "${targetScene.entity_id}" (no detailed config available)`;
+  }
+
+  // Adapt to current light situation
+  const entityKeys = Object.keys(entities);
+
+  // Remove lights that no longer exist in system
+  for (const lightId of entityKeys) {
+    if (!allLightIds.has(lightId)) {
+      delete entities[lightId];
+      healingDetails.push(`removed ${lightId} (no longer in system)`);
     }
   }
 
-  // Get scene entity IDs from config (more reliable than scene.attributes.entity_id)
-  const sceneEntityIds: string[] = sceneConfig?.entities
-    ? Object.keys(sceneConfig.entities)
-    : (scene.attributes.entity_id || []);
-
-  // In exclusive mode: turn off ALL lights first, then set scene lights
-  // This ensures a clean slate - any new lights added to system will be off
+  // Add new lights for exclusive mode
   if (mode === "exclusive") {
-    const allLights = await getLights();
+    for (const light of allLights) {
+      if (!entities[light.entity_id]) {
+        entities[light.entity_id] = "off";
+        healingDetails.push(`added ${light.attributes.friendly_name || light.entity_id} (new light → off)`);
+      }
+    }
+  }
+
+  // DO NOT auto-update HA or local backup during activation!
+  // Only report issues - let user decide to fix with scene_fix or scene_update
+
+  // Build working config for activation (use merged entities for THIS activation only)
+  const workingConfig: SceneConfig = {
+    id: configId || generateSceneId(),
+    name: localBackup?.name || haConfig?.name || entity_id,
+    entities,
+    metadata: { mode },
+  };
+
+  // Build info message about detected issues (but don't fix them)
+  let issueInfo = "";
+  if (healingDetails.length > 0) {
+    issueInfo = `[Issues detected: ${healingDetails.join("; ")}. Use scene_fix to repair.] `;
+  }
+
+  return await activateSceneFromConfig(workingConfig, allLights, issueInfo);
+}
+
+// Helper function to actually activate a scene from config
+async function activateSceneFromConfig(
+  sceneConfig: SceneConfig,
+  allLights: LightState[],
+  prefixMessage: string = ""
+): Promise<string> {
+  const mode = (sceneConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+  const sceneEntityIds = Object.keys(sceneConfig.entities);
+
+  // In exclusive mode: turn off ALL lights first
+  if (mode === "exclusive") {
     const lightsOn = allLights
       .filter((l) => l.state === "on")
       .map((l) => l.entity_id);
 
     if (lightsOn.length > 0) {
-      // Turn off ALL lights first
       await callService("light", "turn_off", { entity_id: lightsOn });
-      // Wait for lights to process the off command (IKEA lights need more time)
       await delay(500);
     }
-  }
-
-  // Explicitly set each light to ensure correct state when switching between scenes
-  // HA's scene.turn_on may not properly reset color mode when light is already on
-  if (!sceneConfig?.entities) {
-    // Fallback to HA scene activation if no config available
-    await callService("scene", "turn_on", { entity_id });
-    const modeInfo = mode === "exclusive" ? " (turned off other lights)" : "";
-    return `Activated scene "${entity_id}"${modeInfo}`;
   }
 
   // Build list of IKEA vs non-IKEA lights
@@ -1119,7 +1577,7 @@ async function handleActivateScene(args: { entity_id: string }): Promise<string>
   const modeInfo = mode === "exclusive" ? " (exclusive)" : "";
   const ikeaInfo = ikeaLights.length > 0 ? ` (${ikeaLights.length} IKEA)` : "";
   const extraInfo = extraTurnedOff > 0 ? ` (+${extraTurnedOff} retry)` : "";
-  return `Activated scene "${entity_id}" - set ${lightsSet} lights${modeInfo}${ikeaInfo}${extraInfo}`;
+  return `${prefixMessage}Activated scene "${sceneConfig.name}" - set ${lightsSet} lights${modeInfo}${ikeaInfo}${extraInfo}`;
 }
 
 async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
@@ -1146,6 +1604,9 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
   }
 
   await deleteSceneConfig(configId);
+
+  // Remove from local backup
+  removeSceneBackup(configId);
 
   return `Deleted scene "${entity_id}"`;
 }
@@ -1213,12 +1674,21 @@ async function handleUpdateScene(args: {
 
   await saveSceneConfig(updatedConfig);
 
-  const mode = existingConfig.metadata?.mode || "unknown";
+  // Update local backup
+  const mode = (existingConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+  backupScene(configId, existingConfig.name, mode, entities);
+
   return `Updated scene "${existingConfig.name}" with ${lightsToCapture.length} lights (mode: ${mode}).`;
 }
 
-async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean }): Promise<string> {
-  const { exclude = [], create_scene = false } = args;
+async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean; user_confirmed?: boolean }): Promise<string> {
+  const { exclude = [], create_scene = false, user_confirmed } = args;
+
+  // Safety check: require explicit user confirmation
+  if (!user_confirmed) {
+    return "BLOCKED: Blackout requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested to turn off all lights.";
+  }
+
   const allLights = await getLights();
 
   // Helper to check if a light should be excluded
@@ -1266,6 +1736,10 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
     };
 
     await saveSceneConfig(sceneConfig);
+
+    // Backup locally
+    backupScene(sceneId, "Blackout", "exclusive", entities);
+
     sceneMessage = `'Blackout' scene ${existingBlackout ? "updated" : "created"} (${lightsToInclude.length} lights). `;
   }
 
@@ -1286,6 +1760,552 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
   await callService("light", "turn_off", { entity_id: entityIds });
 
   return `${sceneMessage}Turned off ${lightsToTurnOff.length} lights.`;
+}
+
+// Diagnose scene issues
+interface SceneDiagnostics {
+  name: string;
+  entityId: string;
+  source: "mcp" | "external";
+  mode: string;
+  issues: string[];
+  lightCount: number;
+  missingLights: string[];
+  removedLights: string[];
+}
+
+interface LightDiagnostics {
+  entityId: string;
+  name: string;
+  manufacturer: string | null;
+  model: string | null;
+  connectionType: string | null;
+  responseTime?: number;
+  status: "ok" | "slow" | "timeout" | "error";
+  error?: string;
+}
+
+async function handleDiagnose(args: { test_connectivity?: boolean; user_confirmed?: boolean }): Promise<string> {
+  const { test_connectivity, user_confirmed } = args;
+
+  // Safety check: connectivity tests require confirmation because they toggle lights
+  const runConnectivityTests = test_connectivity === true && user_confirmed === true;
+
+  if (test_connectivity === true && !user_confirmed) {
+    // User requested connectivity tests but didn't confirm - warn but continue without tests
+    console.error("Warning: Connectivity tests skipped - requires user_confirmed=true");
+  }
+
+  const allLights = await getLights();
+  const allScenes = await getScenes();
+
+  // Collect device info for all lights
+  const lightDiagnostics: LightDiagnostics[] = [];
+
+  for (const light of allLights) {
+    const deviceInfo = await getDeviceInfo(light.entity_id);
+    const diag: LightDiagnostics = {
+      entityId: light.entity_id,
+      name: light.attributes.friendly_name || light.entity_id,
+      manufacturer: deviceInfo.manufacturer,
+      model: deviceInfo.model,
+      connectionType: deviceInfo.connectionType,
+      status: "ok",
+    };
+    lightDiagnostics.push(diag);
+  }
+
+  // Test connectivity if requested AND confirmed
+  if (runConnectivityTests) {
+    for (const diag of lightDiagnostics) {
+      const result = await testLightResponseTime(diag.entityId);
+      diag.responseTime = result.responseTime;
+
+      if (!result.success) {
+        diag.status = "timeout";
+        diag.error = result.error;
+      } else if (result.responseTime > 500) {
+        diag.status = "slow";
+      } else if (result.responseTime > 200) {
+        diag.status = "slow";
+      } else {
+        diag.status = "ok";
+      }
+
+      // Small delay between tests to not overwhelm the network
+      await delay(200);
+    }
+  }
+
+  // Analyze scenes
+  const sceneDiagnostics: SceneDiagnostics[] = [];
+  const allLightIds = new Set(allLights.map((l) => l.entity_id));
+
+  for (const scene of allScenes) {
+    const configId = scene.attributes.id;
+    let config: SceneConfig | null = null;
+
+    if (configId) {
+      config = await getSceneConfig(configId);
+    }
+
+    const issues: string[] = [];
+    const missingLights: string[] = [];
+    const removedLights: string[] = [];
+    const source = config?.metadata?.mode ? "mcp" : "external";
+    const mode = (config?.metadata?.mode as string) || "unknown";
+
+    if (config?.entities) {
+      const sceneEntityIds = Object.keys(config.entities);
+
+      // Check for null values
+      for (const [entityId, entityConfig] of Object.entries(config.entities)) {
+        if (typeof entityConfig === "object" && entityConfig !== null) {
+          const hasNulls = Object.values(entityConfig).some((v) => v === null);
+          if (hasNulls) {
+            issues.push(`null values in ${entityId}`);
+          }
+        }
+      }
+
+      // Check for removed lights (in scene but not in system)
+      for (const entityId of sceneEntityIds) {
+        if (!allLightIds.has(entityId)) {
+          removedLights.push(entityId);
+        }
+      }
+
+      // Check for missing lights (in system but not in scene) - only for exclusive scenes
+      if (mode === "exclusive") {
+        for (const light of allLights) {
+          if (!sceneEntityIds.includes(light.entity_id)) {
+            missingLights.push(light.attributes.friendly_name || light.entity_id);
+          }
+        }
+      }
+    }
+
+    if (removedLights.length > 0) {
+      issues.push(`${removedLights.length} lights no longer exist`);
+    }
+    if (missingLights.length > 0 && mode === "exclusive") {
+      issues.push(`${missingLights.length} new lights not in scene`);
+    }
+
+    sceneDiagnostics.push({
+      name: scene.attributes.friendly_name || scene.entity_id,
+      entityId: scene.entity_id,
+      source,
+      mode,
+      issues,
+      lightCount: config?.entities ? Object.keys(config.entities).length : 0,
+      missingLights,
+      removedLights,
+    });
+  }
+
+  // Build report
+  let report = "VALOJEN DIAGNOSTIIKKA\n";
+  report += "=====================\n\n";
+
+  // Connection types summary
+  const connectionTypes = new Map<string, number>();
+  for (const diag of lightDiagnostics) {
+    const type = diag.connectionType || "Unknown";
+    connectionTypes.set(type, (connectionTypes.get(type) || 0) + 1);
+  }
+
+  report += "YHTEYSTYYPIT:\n";
+  for (const [type, count] of connectionTypes) {
+    const manufacturers = [...new Set(
+      lightDiagnostics
+        .filter((d) => d.connectionType === type && d.manufacturer)
+        .map((d) => d.manufacturer)
+    )].join(", ");
+    report += `  ${type}: ${count} valoa${manufacturers ? ` (${manufacturers})` : ""}\n`;
+  }
+
+  // Response times
+  if (runConnectivityTests) {
+    report += "\nVASTEAJAT (toggle-testi):\n";
+
+    const fast = lightDiagnostics.filter((d) => d.status === "ok");
+    const slow = lightDiagnostics.filter((d) => d.status === "slow");
+    const failed = lightDiagnostics.filter((d) => d.status === "timeout" || d.status === "error");
+
+    report += `  ✓ Nopeat (<200ms): ${fast.length} valoa\n`;
+
+    if (slow.length > 0) {
+      report += `  ⚠ Hitaat (200-500ms): ${slow.length} valoa\n`;
+      for (const d of slow.slice(0, 5)) {
+        report += `    - ${d.name} (${d.connectionType || "?"}): ${d.responseTime}ms\n`;
+      }
+      if (slow.length > 5) {
+        report += `    ... ja ${slow.length - 5} muuta\n`;
+      }
+    }
+
+    if (failed.length > 0) {
+      report += `  ✗ Ongelmalliset: ${failed.length} valoa\n`;
+      for (const d of failed) {
+        report += `    - ${d.name}: ${d.error || "ei vastannut"}\n`;
+      }
+    }
+  }
+
+  // Scene analysis
+  report += "\nSCENET:\n";
+
+  const okScenes = sceneDiagnostics.filter((s) => s.issues.length === 0);
+  const problemScenes = sceneDiagnostics.filter((s) => s.issues.length > 0);
+
+  for (const s of okScenes) {
+    report += `  ✓ ${s.name} - OK (${s.source}, ${s.mode}, ${s.lightCount} valoa)\n`;
+  }
+
+  for (const s of problemScenes) {
+    report += `  ⚠ ${s.name} - ${s.issues.join(", ")}\n`;
+    if (s.source === "external") {
+      report += `    (luotu HA:ssa, ei MCP metadata)\n`;
+    }
+  }
+
+  // Recommendations
+  report += "\nSUOSITUKSET:\n";
+
+  const hasNullIssues = sceneDiagnostics.some((s) => s.issues.some((i) => i.includes("null")));
+  const hasMissingLights = sceneDiagnostics.some((s) => s.missingLights.length > 0);
+  const hasFailedLights = lightDiagnostics.some((d) => d.status === "timeout" || d.status === "error");
+  const hasSlowLights = lightDiagnostics.some((d) => d.status === "slow");
+
+  if (hasNullIssues || hasMissingLights) {
+    report += "  1. Aja scene_fix action='fix_all' korjataksesi scenejen ongelmat\n";
+  }
+  if (hasFailedLights) {
+    const failedNames = lightDiagnostics.filter((d) => d.status === "timeout").map((d) => d.name).join(", ");
+    report += `  2. Tarkista yhteys: ${failedNames}\n`;
+  }
+  if (hasSlowLights) {
+    report += "  3. Hitaat valot: harkitse Zigbee-toistimen lisäämistä\n";
+  }
+  if (!hasNullIssues && !hasMissingLights && !hasFailedLights) {
+    report += "  Ei toimenpiteitä tarvita - kaikki kunnossa!\n";
+  }
+
+  // Local backup status
+  const backups = getAllSceneBackups();
+  const backupCount = Object.keys(backups).length;
+
+  report += "\nLOKAALI VARMUUSKOPIO:\n";
+  if (backupCount === 0) {
+    report += "  Ei varmuuskopioita. Luo scenejä MCP:llä tallentaaksesi ne.\n";
+  } else {
+    report += `  ${backupCount} sceneä varmuuskopioitu:\n`;
+
+    for (const [sceneId, backup] of Object.entries(backups)) {
+      // Check if scene exists in HA
+      const haScene = allScenes.find((s) => s.attributes.id === sceneId);
+      const entityCount = Object.keys(backup.entities).length;
+
+      if (!haScene) {
+        report += `  ⚠ ${backup.name} - PUUTTUU HA:sta (${entityCount} valoa, voidaan palauttaa)\n`;
+      } else {
+        // Check if HA config matches backup
+        const haConfig = await getSceneConfig(sceneId);
+        const haEntityCount = haConfig?.entities ? Object.keys(haConfig.entities).length : 0;
+
+        if (haEntityCount !== entityCount) {
+          report += `  ⚠ ${backup.name} - eroaa HA:sta (backup: ${entityCount}, HA: ${haEntityCount} valoa)\n`;
+        } else {
+          report += `  ✓ ${backup.name} - synkronoitu (${entityCount} valoa)\n`;
+        }
+      }
+    }
+  }
+
+  return report;
+}
+
+async function handleFix(args: {
+  action: "fix_all" | "fix_scene" | "test_scene" | "restore_from_backup";
+  scene_name?: string;
+  issues?: string[];
+  user_confirmed?: boolean;
+}): Promise<string> {
+  const { action, scene_name, issues, user_confirmed } = args;
+
+  if (action === "fix_all") {
+    const allLights = await getLights();
+    const allScenes = await getScenes();
+    const allLightIds = new Set(allLights.map((l) => l.entity_id));
+    let fixedCount = 0;
+    let fixReport = "KORJAUKSET:\n\n";
+
+    for (const scene of allScenes) {
+      const configId = scene.attributes.id;
+      if (!configId) continue;
+
+      const config = await getSceneConfig(configId);
+      if (!config) continue;
+
+      let modified = false;
+      const sceneName = scene.attributes.friendly_name || scene.entity_id;
+
+      // Fix null values
+      if (config.entities) {
+        for (const [entityId, entityConfig] of Object.entries(config.entities)) {
+          if (typeof entityConfig === "object" && entityConfig !== null) {
+            const cleanedConfig: Record<string, unknown> = {};
+            let hasNulls = false;
+
+            for (const [key, value] of Object.entries(entityConfig)) {
+              if (value !== null && value !== undefined) {
+                cleanedConfig[key] = value;
+              } else {
+                hasNulls = true;
+              }
+            }
+
+            if (hasNulls) {
+              config.entities[entityId] = cleanedConfig;
+              modified = true;
+            }
+          }
+        }
+
+        // Remove references to deleted lights
+        const sceneEntityIds = Object.keys(config.entities);
+        for (const entityId of sceneEntityIds) {
+          if (!allLightIds.has(entityId)) {
+            delete config.entities[entityId];
+            modified = true;
+            fixReport += `  ${sceneName}: poistettu ${entityId} (ei enää olemassa)\n`;
+          }
+        }
+
+        // Add missing lights to exclusive scenes
+        const mode = config.metadata?.mode;
+        if (mode === "exclusive") {
+          for (const light of allLights) {
+            if (!sceneEntityIds.includes(light.entity_id)) {
+              // Add new light with state "off"
+              config.entities[light.entity_id] = "off";
+              modified = true;
+              fixReport += `  ${sceneName}: lisätty ${light.attributes.friendly_name || light.entity_id} (state: off)\n`;
+            }
+          }
+        }
+      }
+
+      if (modified) {
+        await saveSceneConfig(config);
+        fixedCount++;
+      }
+    }
+
+    if (fixedCount === 0) {
+      return "Ei korjattavaa - kaikki scenet kunnossa!";
+    }
+
+    return `${fixReport}\nKorjattu ${fixedCount} sceneä.`;
+  }
+
+  if (action === "fix_scene") {
+    if (!scene_name) {
+      return "Error: scene_name required for fix_scene action";
+    }
+
+    const allScenes = await getScenes();
+    const scene = allScenes.find(
+      (s) => s.attributes.friendly_name?.toLowerCase() === scene_name.toLowerCase()
+    );
+
+    if (!scene) {
+      return `Scene "${scene_name}" not found.`;
+    }
+
+    const configId = scene.attributes.id;
+    if (!configId) {
+      return `Scene "${scene_name}" has no config ID - cannot fix.`;
+    }
+
+    const config = await getSceneConfig(configId);
+    if (!config) {
+      return `Could not load config for scene "${scene_name}".`;
+    }
+
+    const allLights = await getLights();
+    const allLightIds = new Set(allLights.map((l) => l.entity_id));
+    let changes: string[] = [];
+
+    if (config.entities) {
+      // Fix null values
+      for (const [entityId, entityConfig] of Object.entries(config.entities)) {
+        if (typeof entityConfig === "object" && entityConfig !== null) {
+          const cleanedConfig: Record<string, unknown> = {};
+          let hasNulls = false;
+
+          for (const [key, value] of Object.entries(entityConfig)) {
+            if (value !== null && value !== undefined) {
+              cleanedConfig[key] = value;
+            } else {
+              hasNulls = true;
+            }
+          }
+
+          if (hasNulls) {
+            config.entities[entityId] = cleanedConfig;
+            changes.push(`Poistettu null-arvot: ${entityId}`);
+          }
+        }
+      }
+
+      // Remove deleted lights
+      const sceneEntityIds = Object.keys(config.entities);
+      for (const entityId of sceneEntityIds) {
+        if (!allLightIds.has(entityId)) {
+          delete config.entities[entityId];
+          changes.push(`Poistettu: ${entityId} (ei enää olemassa)`);
+        }
+      }
+
+      // Add missing lights if exclusive
+      if (config.metadata?.mode === "exclusive") {
+        for (const light of allLights) {
+          if (!sceneEntityIds.includes(light.entity_id)) {
+            config.entities[light.entity_id] = "off";
+            changes.push(`Lisätty: ${light.attributes.friendly_name || light.entity_id} (off)`);
+          }
+        }
+      }
+    }
+
+    if (changes.length === 0) {
+      return `Scene "${scene_name}" - ei korjattavaa.`;
+    }
+
+    await saveSceneConfig(config);
+    return `Scene "${scene_name}" korjattu:\n${changes.map((c) => `  - ${c}`).join("\n")}`;
+  }
+
+  if (action === "test_scene") {
+    // Safety check: test_scene changes lights, requires confirmation
+    if (!user_confirmed) {
+      return "BLOCKED: test_scene changes light states and requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested to test this scene.";
+    }
+
+    if (!scene_name) {
+      return "Error: scene_name required for test_scene action";
+    }
+
+    const allScenes = await getScenes();
+    const scene = allScenes.find(
+      (s) => s.attributes.friendly_name?.toLowerCase() === scene_name.toLowerCase()
+    );
+
+    if (!scene) {
+      return `Scene "${scene_name}" not found.`;
+    }
+
+    // Activate the scene (already confirmed by user)
+    await handleActivateScene({ entity_id: scene.entity_id, user_confirmed: true });
+
+    if (issues && issues.length > 0) {
+      // User has reported issues - analyze and suggest fixes
+      let suggestions = `Raportoidut ongelmat scenelle "${scene_name}":\n\n`;
+
+      for (const issue of issues) {
+        suggestions += `  - ${issue}\n`;
+      }
+
+      suggestions += "\nMahdolliset korjaukset:\n";
+      suggestions += "  1. Päivitä scene nykyisellä valotilanteella: scene_update\n";
+      suggestions += "  2. Poista scene ja luo uudelleen: scene_delete + scene_create\n";
+      suggestions += "  3. Aja diagnostiikka: scene_diagnose\n";
+
+      return suggestions;
+    }
+
+    return `Scene "${scene_name}" aktivoitu. Tarkista valot ja kerro mikä meni pieleen (issues-parametri).`;
+  }
+
+  if (action === "restore_from_backup") {
+    const backups = getAllSceneBackups();
+    const allScenes = await getScenes();
+    const allLights = await getLights();
+    const allLightIds = new Set(allLights.map((l) => l.entity_id));
+
+    let restoreReport = "PALAUTUS VARMUUSKOPIOSTA:\n\n";
+    let restoredCount = 0;
+
+    // Filter backups to restore
+    const backupsToRestore: [string, LocalSceneBackup][] = [];
+
+    if (scene_name) {
+      // Restore specific scene by name
+      const entry = Object.entries(backups).find(
+        ([, backup]) => backup.name.toLowerCase() === scene_name.toLowerCase()
+      );
+      if (!entry) {
+        return `Scene "${scene_name}" not found in local backup.`;
+      }
+      backupsToRestore.push(entry);
+    } else {
+      // Restore all missing scenes
+      for (const [sceneId, backup] of Object.entries(backups)) {
+        const existsInHA = allScenes.some((s) => s.attributes.id === sceneId);
+        if (!existsInHA) {
+          backupsToRestore.push([sceneId, backup]);
+        }
+      }
+    }
+
+    if (backupsToRestore.length === 0) {
+      return "Ei palautettavia scenejä - kaikki varmuuskopioidut scenet ovat jo HA:ssa.";
+    }
+
+    for (const [sceneId, backup] of backupsToRestore) {
+      // Update entities to match current system
+      // Remove lights that no longer exist, add new lights for exclusive mode
+      const updatedEntities: Record<string, Record<string, unknown> | string> = {};
+
+      for (const [entityId, entityConfig] of Object.entries(backup.entities)) {
+        if (allLightIds.has(entityId)) {
+          updatedEntities[entityId] = entityConfig;
+        }
+      }
+
+      // For exclusive mode, add any new lights as "off"
+      if (backup.mode === "exclusive") {
+        for (const light of allLights) {
+          if (!updatedEntities[light.entity_id]) {
+            updatedEntities[light.entity_id] = "off";
+          }
+        }
+      }
+
+      // Create scene config
+      const sceneConfig: SceneConfig = {
+        id: sceneId,
+        name: backup.name,
+        entities: updatedEntities,
+        metadata: {
+          mode: backup.mode,
+        },
+      };
+
+      await saveSceneConfig(sceneConfig);
+      restoredCount++;
+
+      const origCount = Object.keys(backup.entities).length;
+      const newCount = Object.keys(updatedEntities).length;
+      restoreReport += `  ✓ ${backup.name} palautettu (${origCount} → ${newCount} valoa)\n`;
+    }
+
+    return `${restoreReport}\nPalautettu ${restoredCount} sceneä.`;
+  }
+
+  return "Unknown action";
 }
 
 // Main server setup
@@ -1329,6 +2349,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             rgb_color?: [number, number, number];
             color_temp_kelvin?: number;
             effect?: string;
+            user_confirmed?: boolean;
           }
         );
         break;
@@ -1346,7 +2367,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await handleListScenes();
         break;
       case "scene_activate":
-        result = await handleActivateScene(args as { entity_id: string });
+        result = await handleActivateScene(args as { entity_id: string; user_confirmed?: boolean });
         break;
       case "scene_delete":
         result = await handleDeleteScene(args as { entity_id: string });
@@ -1357,7 +2378,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         break;
       case "scene_blackout":
-        result = await handleBlackout(args as { exclude?: string[]; create_scene?: boolean });
+        result = await handleBlackout(args as { exclude?: string[]; create_scene?: boolean; user_confirmed?: boolean });
+        break;
+      case "scene_diagnose":
+        result = await handleDiagnose(args as { test_connectivity?: boolean; user_confirmed?: boolean });
+        break;
+      case "scene_fix":
+        result = await handleFix(
+          args as {
+            action: "fix_all" | "fix_scene" | "test_scene" | "restore_from_backup";
+            scene_name?: string;
+            issues?: string[];
+            user_confirmed?: boolean;
+          }
+        );
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
