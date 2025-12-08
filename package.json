@@ -1,6 +1,6 @@
 {
   "name": "ha-mcp-server",
-  "version": "0.6.10",
+  "version": "0.7.2",
   "mcpName": "io.github.Koneisto/HomeAssistant-Light-MCP",
   "description": "MCP server for controlling Home Assistant lights and managing scenes. Lights only by design for safety.",
   "main": "dist/index.js",
