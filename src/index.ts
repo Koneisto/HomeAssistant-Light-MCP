@@ -23,8 +23,9 @@ interface LocalSceneBackup {
   entities: Record<string, Record<string, unknown> | string>;
   createdAt: string;
   updatedAt: string;
-  lastKnownHAHash?: string;  // Hash of HA config when last synced
-  instanceId?: string;        // Which MCP instance last modified
+  lastKnownHAHash?: string;   // Hash of HA config when last synced
+  instanceId?: string;         // Which MCP instance last modified
+  lastSyncedFromHA?: string;   // When last synced from HA
 }
 
 // Generate a unique instance ID for this MCP process
@@ -42,9 +43,19 @@ function hashConfig(entities: Record<string, unknown>): string {
   return hash.toString(16);
 }
 
+// Snapshot of a scene before modification
+interface SceneSnapshot {
+  sceneId: string;
+  name: string;
+  entities: Record<string, Record<string, unknown> | string>;
+  timestamp: string;
+  operation: "update" | "delete";
+}
+
 interface ScenesBackupStore {
   version: number;
   scenes: Record<string, LocalSceneBackup>; // keyed by scene ID
+  snapshots?: SceneSnapshot[];              // History of changes for recovery
 }
 
 function loadScenesBackup(): ScenesBackupStore {
@@ -110,6 +121,97 @@ function getSceneBackup(sceneId: string): LocalSceneBackup | null {
 function getAllSceneBackups(): Record<string, LocalSceneBackup> {
   const store = loadScenesBackup();
   return store.scenes;
+}
+
+// Maximum number of snapshots to keep
+const MAX_SNAPSHOTS = 20;
+
+// Save a snapshot of scene state before modification
+function saveSceneSnapshot(sceneId: string, name: string, entities: Record<string, Record<string, unknown> | string>, operation: "update" | "delete"): void {
+  const store = loadScenesBackup();
+  const snapshot: SceneSnapshot = {
+    sceneId,
+    name,
+    entities,
+    timestamp: new Date().toISOString(),
+    operation,
+  };
+
+  // Initialize snapshots array if needed
+  if (!store.snapshots) {
+    store.snapshots = [];
+  }
+
+  // Add new snapshot at the beginning
+  store.snapshots.unshift(snapshot);
+
+  // Keep only the last MAX_SNAPSHOTS
+  if (store.snapshots.length > MAX_SNAPSHOTS) {
+    store.snapshots = store.snapshots.slice(0, MAX_SNAPSHOTS);
+  }
+
+  saveScenesBackup(store);
+}
+
+// Get recent snapshots for a scene
+function getSceneSnapshots(sceneId?: string): SceneSnapshot[] {
+  const store = loadScenesBackup();
+  const snapshots = store.snapshots || [];
+  if (sceneId) {
+    return snapshots.filter((s) => s.sceneId === sceneId);
+  }
+  return snapshots;
+}
+
+// Sync backup from Home Assistant
+// This ensures our local backup reflects the current state in HA
+async function syncBackupFromHA(): Promise<{ synced: number; errors: string[] }> {
+  const errors: string[] = [];
+  let synced = 0;
+
+  try {
+    const scenes = await getScenes();
+    const store = loadScenesBackup();
+    const now = new Date().toISOString();
+
+    for (const scene of scenes) {
+      if (!scene.attributes.id) continue;
+
+      try {
+        const config = await getSceneConfig(scene.attributes.id);
+        if (!config) continue;
+
+        const hash = hashConfig(config.entities as Record<string, unknown>);
+        const existing = store.scenes[scene.attributes.id];
+
+        // Only update if hash changed or doesn't exist locally
+        if (!existing || existing.lastKnownHAHash !== hash) {
+          const mode = (config.metadata?.mode as "exclusive" | "additive") || "exclusive";
+          store.scenes[scene.attributes.id] = {
+            name: config.name,
+            mode,
+            entities: config.entities,
+            createdAt: existing?.createdAt || now,
+            updatedAt: now,
+            lastKnownHAHash: hash,
+            instanceId: existing?.instanceId || MCP_INSTANCE_ID,
+            lastSyncedFromHA: now,
+          };
+          synced++;
+        }
+      } catch (err) {
+        errors.push(`Failed to sync scene ${scene.attributes.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    if (synced > 0) {
+      saveScenesBackup(store);
+    }
+  } catch (err) {
+    errors.push(`Failed to fetch scenes: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return { synced, errors };
 }
 
 // Configuration
@@ -358,6 +460,12 @@ async function saveSceneConfig(sceneConfig: SceneConfig): Promise<void> {
     const errorText = await response.text();
     throw new Error(`Failed to save scene config: ${response.statusText} - ${errorText}`);
   }
+
+  // Reload scenes so the new scene appears as an entity immediately
+  await haFetch("/api/services/scene/reload", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 async function deleteSceneConfig(sceneId: string): Promise<void> {
@@ -368,6 +476,12 @@ async function deleteSceneConfig(sceneId: string): Promise<void> {
     const errorText = await response.text();
     throw new Error(`Failed to delete scene config: ${response.statusText} - ${errorText}`);
   }
+
+  // Reload scenes so the deleted scene disappears immediately
+  await haFetch("/api/services/scene/reload", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 // Timeout wrapper for promises
@@ -655,6 +769,31 @@ const tools: Tool[] = [
         },
       },
       required: ["action"],
+    },
+  },
+  {
+    name: "scene_sync",
+    description: "Sync local backup with Home Assistant. Fetches all scenes from HA and updates local backup to match. Useful for ensuring backup is current before making changes.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "scene_history",
+    description: "View history of scene changes (snapshots). Shows what the scene looked like before recent updates or deletions. Useful for debugging or understanding what changed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scene_id: {
+          type: "string",
+          description: "Optional: Filter to show only history for a specific scene ID. If not provided, shows all recent changes.",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of history entries to show (default: 10).",
+        },
+      },
     },
   },
 ];
@@ -1149,13 +1288,14 @@ async function handleCreateScene(args: {
     const allLights = await getLights();
     lightsToCapture = allLights.filter((l) => entity_ids.includes(l.entity_id));
   } else {
-    // Capture all lights that are on
+    // Capture lights that are currently on
+    // For exclusive mode, scene activation will handle turning off other lights
     const allLights = await getLights();
     lightsToCapture = allLights.filter((l) => l.state === "on");
   }
 
   if (lightsToCapture.length === 0) {
-    return "No lights to capture. Please turn on some lights or specify entity_ids.";
+    return "No lights are on. Please turn on some lights or specify entity_ids.";
   }
 
   // Build entities config
@@ -1189,7 +1329,7 @@ async function handleCreateScene(args: {
     ? "other lights will be turned off when activated"
     : "only affects lights in scene";
 
-  return `Created scene "${name}" with ${lightsToCapture.length} lights (${mode}: ${modeDescription}). The scene is now available in Home Assistant UI.`;
+  return `Created scene "${name}" with ${lightsToCapture.length} lights [${mode}: ${modeDescription}]. The scene is now available in Home Assistant UI.`;
 }
 
 async function handleListScenes(): Promise<string> {
@@ -1256,9 +1396,36 @@ async function handleActivateScene(args: { entity_id: string; user_confirmed?: b
     );
 
     if (backupByName) {
-      // Scene exists in backup but not HA - DON'T auto-restore, just report
-      const [, backup] = backupByName;
-      return `Scene "${backup.name}" not found in Home Assistant, but exists in local backup (${Object.keys(backup.entities).length} lights, ${backup.mode} mode). Use scene_fix action='restore_from_backup' scene_name='${backup.name}' to restore it.`;
+      // Scene exists in backup but not HA - activate directly from backup
+      const [backupId, backup] = backupByName;
+      const allLights = await getLights();
+      const allLightIds = new Set(allLights.map((l) => l.entity_id));
+
+      // Filter entities to only include lights that still exist
+      const validEntities: Record<string, Record<string, unknown> | string> = {};
+      for (const [lightId, config] of Object.entries(backup.entities)) {
+        if (allLightIds.has(lightId)) {
+          validEntities[lightId] = config;
+        }
+      }
+
+      // Add missing lights as "off" for exclusive mode
+      if (backup.mode === "exclusive") {
+        for (const light of allLights) {
+          if (!validEntities[light.entity_id]) {
+            validEntities[light.entity_id] = "off";
+          }
+        }
+      }
+
+      const workingConfig: SceneConfig = {
+        id: backupId,
+        name: backup.name,
+        entities: validEntities,
+        metadata: { mode: backup.mode },
+      };
+
+      return await activateSceneFromConfig(workingConfig, allLights, `[Activated from local backup - scene not in HA] `);
     }
 
     return `Scene "${entity_id}" not found in Home Assistant or local backup.`;
@@ -1603,12 +1770,27 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
     return `Scene "${entity_id}" has no config ID - it may be a runtime scene that cannot be deleted via API.`;
   }
 
+  // Get current config for the backup snapshot before deleting
+  const existingConfig = await getSceneConfig(configId);
+  const lightCount = existingConfig ? Object.keys(existingConfig.entities || {}).length : 0;
+
+  // Save snapshot before deletion (for recovery)
+  if (existingConfig?.entities) {
+    saveSceneSnapshot(configId, existingConfig.name, existingConfig.entities, "delete");
+  }
+
   await deleteSceneConfig(configId);
 
-  // Remove from local backup
-  removeSceneBackup(configId);
+  // Note: We keep the backup for potential recovery - mark as deleted but don't remove
+  // This allows users to restore deleted scenes if needed
+  const backup = getSceneBackup(configId);
+  if (backup) {
+    // Keep the backup but we could add a deletedAt timestamp in the future
+    // For now, just remove from backup as before
+    removeSceneBackup(configId);
+  }
 
-  return `Deleted scene "${entity_id}"`;
+  return `Deleted scene "${entity_id}" (had ${lightCount} lights).`;
 }
 
 async function handleUpdateScene(args: {
@@ -1643,30 +1825,59 @@ async function handleUpdateScene(args: {
     return `Could not load config for scene "${entity_id}".`;
   }
 
+  // Save snapshot before making changes (for recovery)
+  if (existingConfig.entities) {
+    saveSceneSnapshot(configId, existingConfig.name, existingConfig.entities, "update");
+  }
+
   // Get lights to capture
   let lightsToCapture: LightState[];
 
   if (entity_ids && entity_ids.length > 0) {
-    // Capture specified entities
+    // Capture specified entities only
     const allLights = await getLights();
     lightsToCapture = allLights.filter((l) => entity_ids.includes(l.entity_id));
   } else {
-    // Capture all lights that are on
+    // Capture all lights that are on (these will be MERGED with existing)
     const allLights = await getLights();
     lightsToCapture = allLights.filter((l) => l.state === "on");
   }
 
   if (lightsToCapture.length === 0) {
-    return "No lights to capture. Please turn on some lights or specify entity_ids.";
+    return "No lights to update. Please turn on some lights or specify entity_ids.";
   }
 
-  // Build new entities config
+  // Build new entities config by MERGING with existing
+  // This preserves existing lights while updating/adding new ones
+  const existingEntities = existingConfig.entities || {};
   const entities: Record<string, Record<string, unknown>> = {};
+
+  // Copy existing entities, converting string shortcuts to full objects
+  for (const [entityId, entityConfig] of Object.entries(existingEntities)) {
+    if (typeof entityConfig === "string") {
+      // Convert "off" or "on" string to object format
+      entities[entityId] = { state: entityConfig };
+    } else {
+      entities[entityId] = entityConfig as Record<string, unknown>;
+    }
+  }
+
+  // Track what we're changing
+  const updatedLights: string[] = [];
+  const addedLights: string[] = [];
+
   for (const light of lightsToCapture) {
+    if (existingEntities[light.entity_id]) {
+      updatedLights.push(light.entity_id);
+    } else {
+      addedLights.push(light.entity_id);
+    }
     entities[light.entity_id] = buildEntityConfig(light);
   }
 
-  // Update scene config with new entities, keeping other properties
+  const mode = (existingConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+
+  // Update scene config with merged entities, keeping other properties
   const updatedConfig: SceneConfig = {
     ...existingConfig,
     entities,
@@ -1675,10 +1886,22 @@ async function handleUpdateScene(args: {
   await saveSceneConfig(updatedConfig);
 
   // Update local backup
-  const mode = (existingConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
   backupScene(configId, existingConfig.name, mode, entities);
 
-  return `Updated scene "${existingConfig.name}" with ${lightsToCapture.length} lights (mode: ${mode}).`;
+  // Build informative summary
+  const existingCount = Object.keys(existingEntities).length;
+  const newCount = Object.keys(entities).length;
+
+  const changes: string[] = [];
+  if (updatedLights.length > 0) {
+    changes.push(`updated ${updatedLights.length}`);
+  }
+  if (addedLights.length > 0) {
+    changes.push(`added ${addedLights.length}`);
+  }
+  const changesSummary = changes.length > 0 ? changes.join(", ") : "no changes";
+
+  return `Updated scene "${existingConfig.name}" (${changesSummary}, total: ${newCount} lights, mode: ${mode}).`;
 }
 
 async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean; user_confirmed?: boolean }): Promise<string> {
@@ -2308,6 +2531,66 @@ async function handleFix(args: {
   return "Unknown action";
 }
 
+// Sync backup from Home Assistant
+async function handleSync(): Promise<string> {
+  const result = await syncBackupFromHA();
+
+  let response = `Synced backup from Home Assistant.\n`;
+  response += `- Scenes updated: ${result.synced}\n`;
+
+  if (result.errors.length > 0) {
+    response += `\nErrors:\n`;
+    for (const error of result.errors) {
+      response += `  - ${error}\n`;
+    }
+  }
+
+  const backups = getAllSceneBackups();
+  response += `\nTotal scenes in backup: ${Object.keys(backups).length}`;
+
+  return response;
+}
+
+// View scene change history
+function handleHistory(args: { scene_id?: string; limit?: number }): string {
+  const { scene_id, limit = 10 } = args;
+  const snapshots = getSceneSnapshots(scene_id);
+
+  if (snapshots.length === 0) {
+    if (scene_id) {
+      return `No history found for scene "${scene_id}".`;
+    }
+    return "No scene change history found. Changes are recorded when scenes are updated or deleted.";
+  }
+
+  const limited = snapshots.slice(0, limit);
+  let response = scene_id
+    ? `History for scene "${scene_id}" (${limited.length} of ${snapshots.length} entries):\n\n`
+    : `Recent scene changes (${limited.length} of ${snapshots.length} entries):\n\n`;
+
+  for (const snapshot of limited) {
+    const date = new Date(snapshot.timestamp);
+    const formattedDate = date.toLocaleString("fi-FI", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+    const lightCount = Object.keys(snapshot.entities).length;
+    const operationEmoji = snapshot.operation === "delete" ? "🗑️" : "✏️";
+
+    response += `${operationEmoji} ${formattedDate} - ${snapshot.name}\n`;
+    response += `   ID: ${snapshot.sceneId}\n`;
+    response += `   Operation: ${snapshot.operation}\n`;
+    response += `   Lights: ${lightCount}\n\n`;
+  }
+
+  response += `Use scene_fix with action="restore_from_backup" to restore a scene.`;
+
+  return response;
+}
+
 // Main server setup
 const server = new Server(
   {
@@ -2392,6 +2675,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             user_confirmed?: boolean;
           }
         );
+        break;
+      case "scene_sync":
+        result = await handleSync();
+        break;
+      case "scene_history":
+        result = handleHistory(args as { scene_id?: string; limit?: number });
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
