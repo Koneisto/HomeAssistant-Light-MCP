@@ -686,7 +686,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_update",
-    description: "Update an existing scene with current light states. ONLY call this when user EXPLICITLY asks to save/update a scene. Do NOT call automatically after adjusting lights.",
+    description: "Update an existing scene with current light states. ONLY call this when user EXPLICITLY asks to save/update a scene. Do NOT call automatically after adjusting lights. For exclusive mode: captures ALL lights (on lights with settings, off lights as 'off').",
     inputSchema: {
       type: "object",
       properties: {
@@ -697,7 +697,12 @@ const tools: Tool[] = [
         entity_ids: {
           type: "array",
           items: { type: "string" },
-          description: "List of entity IDs to capture. If not provided, captures all lights that are currently on.",
+          description: "List of entity IDs to capture as 'on'. If not provided, captures all lights that are currently on.",
+        },
+        mode: {
+          type: "string",
+          enum: ["exclusive", "additive"],
+          description: "Change scene mode. 'exclusive': turns off lights not in scene (saves ALL lights). 'additive': only affects lights in scene. If not provided, keeps existing mode.",
         },
       },
       required: ["entity_id"],
@@ -1280,27 +1285,39 @@ async function handleCreateScene(args: {
     return `Scene "${name}" already exists. Use scene_update to modify it, or scene_delete to remove it first.`;
   }
 
-  // Get lights to capture
-  let lightsToCapture: LightState[];
+  // Get all lights from Home Assistant
+  const allLights = await getLights();
+
+  // Determine which lights to capture as "on" with their current state
+  let lightsOn: LightState[];
 
   if (entity_ids && entity_ids.length > 0) {
-    // Capture specified entities
-    const allLights = await getLights();
-    lightsToCapture = allLights.filter((l) => entity_ids.includes(l.entity_id));
+    // Capture specified entities as "on"
+    lightsOn = allLights.filter((l) => entity_ids.includes(l.entity_id));
   } else {
     // Capture lights that are currently on
-    // For exclusive mode, scene activation will handle turning off other lights
-    const allLights = await getLights();
-    lightsToCapture = allLights.filter((l) => l.state === "on");
+    lightsOn = allLights.filter((l) => l.state === "on");
   }
 
-  if (lightsToCapture.length === 0) {
+  if (lightsOn.length === 0) {
     return "No lights are on. Please turn on some lights or specify entity_ids.";
   }
 
   // Build entities config
-  const entities: Record<string, Record<string, unknown>> = {};
-  for (const light of lightsToCapture) {
+  const entities: Record<string, Record<string, unknown> | string> = {};
+
+  // For EXCLUSIVE mode: include ALL lights
+  // - Lights that are on: save with current state/brightness/color
+  // - Lights that are off: save as "off" so they turn off when scene activates
+  if (mode === "exclusive") {
+    // First, set ALL lights to "off"
+    for (const light of allLights) {
+      entities[light.entity_id] = "off";
+    }
+  }
+
+  // Then set the "on" lights with their full configuration (overwrites "off" for exclusive)
+  for (const light of lightsOn) {
     entities[light.entity_id] = buildEntityConfig(light);
   }
 
@@ -1329,7 +1346,11 @@ async function handleCreateScene(args: {
     ? "other lights will be turned off when activated"
     : "only affects lights in scene";
 
-  return `Created scene "${name}" with ${lightsToCapture.length} lights [${mode}: ${modeDescription}]. The scene is now available in Home Assistant UI.`;
+  const onCount = lightsOn.length;
+  const offCount = mode === "exclusive" ? allLights.length - onCount : 0;
+  const lightsSummary = mode === "exclusive" ? `${onCount} on, ${offCount} off` : `${onCount}`;
+
+  return `Created scene "${name}" with ${Object.keys(entities).length} lights [${lightsSummary}] [${mode}: ${modeDescription}]. The scene is now available in Home Assistant UI.`;
 }
 
 async function handleListScenes(): Promise<string> {
@@ -1567,6 +1588,22 @@ async function activateSceneFromConfig(
   prefixMessage: string = ""
 ): Promise<string> {
   const mode = (sceneConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+  const isDynamicBlackout = sceneConfig.metadata?.dynamicBlackout === true;
+
+  // DYNAMIC BLACKOUT: Simply turn off ALL lights, ignore stored entities
+  if (isDynamicBlackout) {
+    const lightsOn = allLights
+      .filter((l) => l.state === "on")
+      .map((l) => l.entity_id);
+
+    if (lightsOn.length === 0) {
+      return `${prefixMessage}Blackout: All ${allLights.length} lights are already off.`;
+    }
+
+    await callService("light", "turn_off", { entity_id: lightsOn });
+    return `${prefixMessage}Blackout: Turned off ${lightsOn.length} lights (${allLights.length} total in system).`;
+  }
+
   const sceneEntityIds = Object.keys(sceneConfig.entities);
 
   // In exclusive mode: turn off ALL lights first
@@ -1796,8 +1833,9 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
 async function handleUpdateScene(args: {
   entity_id: string;
   entity_ids?: string[];
+  mode?: "exclusive" | "additive";
 }): Promise<string> {
-  let { entity_id, entity_ids } = args;
+  let { entity_id, entity_ids, mode: newMode } = args;
 
   // Add scene. prefix if not present
   if (!entity_id.startsWith("scene.")) {
@@ -1819,7 +1857,7 @@ async function handleUpdateScene(args: {
     return `Scene "${entity_id}" has no config ID - it may be a runtime scene that cannot be updated via API.`;
   }
 
-  // Get existing scene config to preserve name, mode, and icon
+  // Get existing scene config to preserve name and icon
   const existingConfig = await getSceneConfig(configId);
   if (!existingConfig) {
     return `Could not load config for scene "${entity_id}".`;
@@ -1830,43 +1868,49 @@ async function handleUpdateScene(args: {
     saveSceneSnapshot(configId, existingConfig.name, existingConfig.entities, "update");
   }
 
-  // Get lights to capture
-  let lightsToCapture: LightState[];
+  // Determine mode: use new mode if provided, otherwise keep existing
+  const existingMode = (existingConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
+  const mode = newMode || existingMode;
+  const modeChanged = newMode && newMode !== existingMode;
+
+  // Get all lights from Home Assistant
+  const allLights = await getLights();
+
+  // Determine which lights to capture as "on" with their current state
+  let lightsOn: LightState[];
 
   if (entity_ids && entity_ids.length > 0) {
-    // Capture specified entities only
-    const allLights = await getLights();
-    lightsToCapture = allLights.filter((l) => entity_ids.includes(l.entity_id));
+    // Capture specified entities as "on"
+    lightsOn = allLights.filter((l) => entity_ids.includes(l.entity_id));
   } else {
-    // Capture all lights that are on (these will be MERGED with existing)
-    const allLights = await getLights();
-    lightsToCapture = allLights.filter((l) => l.state === "on");
+    // Capture lights that are currently on
+    lightsOn = allLights.filter((l) => l.state === "on");
   }
 
-  if (lightsToCapture.length === 0) {
+  if (lightsOn.length === 0) {
     return "No lights to update. Please turn on some lights or specify entity_ids.";
   }
 
-  // Build new entities config by MERGING with existing
-  // This preserves existing lights while updating/adding new ones
-  const existingEntities = existingConfig.entities || {};
-  const entities: Record<string, Record<string, unknown>> = {};
+  // Build entities config
+  const entities: Record<string, Record<string, unknown> | string> = {};
 
-  // Copy existing entities, converting string shortcuts to full objects
-  for (const [entityId, entityConfig] of Object.entries(existingEntities)) {
-    if (typeof entityConfig === "string") {
-      // Convert "off" or "on" string to object format
-      entities[entityId] = { state: entityConfig };
-    } else {
-      entities[entityId] = entityConfig as Record<string, unknown>;
+  // For EXCLUSIVE mode: include ALL lights
+  // - Lights that are on: save with current state/brightness/color
+  // - Lights that are off: save as "off" so they turn off when scene activates
+  if (mode === "exclusive") {
+    // First, set ALL lights to "off"
+    for (const light of allLights) {
+      entities[light.entity_id] = "off";
     }
   }
 
   // Track what we're changing
+  const existingEntities = existingConfig.entities || {};
   const updatedLights: string[] = [];
   const addedLights: string[] = [];
 
-  for (const light of lightsToCapture) {
+  // Then set the "on" lights with their full configuration
+  for (const light of lightsOn) {
     if (existingEntities[light.entity_id]) {
       updatedLights.push(light.entity_id);
     } else {
@@ -1875,12 +1919,14 @@ async function handleUpdateScene(args: {
     entities[light.entity_id] = buildEntityConfig(light);
   }
 
-  const mode = (existingConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
-
-  // Update scene config with merged entities, keeping other properties
+  // Update scene config with new entities and mode
   const updatedConfig: SceneConfig = {
     ...existingConfig,
     entities,
+    metadata: {
+      ...existingConfig.metadata,
+      mode,
+    },
   };
 
   await saveSceneConfig(updatedConfig);
@@ -1891,6 +1937,8 @@ async function handleUpdateScene(args: {
   // Build informative summary
   const existingCount = Object.keys(existingEntities).length;
   const newCount = Object.keys(entities).length;
+  const onCount = lightsOn.length;
+  const offCount = mode === "exclusive" ? allLights.length - onCount : 0;
 
   const changes: string[] = [];
   if (updatedLights.length > 0) {
@@ -1899,9 +1947,16 @@ async function handleUpdateScene(args: {
   if (addedLights.length > 0) {
     changes.push(`added ${addedLights.length}`);
   }
+  if (modeChanged) {
+    changes.push(`mode: ${existingMode} → ${mode}`);
+  }
   const changesSummary = changes.length > 0 ? changes.join(", ") : "no changes";
 
-  return `Updated scene "${existingConfig.name}" (${changesSummary}, total: ${newCount} lights, mode: ${mode}).`;
+  const modeInfo = mode === "exclusive"
+    ? `${onCount} on, ${offCount} off`
+    : `${onCount} lights`;
+
+  return `Updated scene "${existingConfig.name}" (${changesSummary}, total: ${newCount} lights [${modeInfo}], mode: ${mode}).`;
 }
 
 async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean; user_confirmed?: boolean }): Promise<string> {
@@ -1933,12 +1988,9 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
 
   // Only create/update Blackout scene if explicitly requested
   if (create_scene) {
-    // Build entities config with ALL lights set to "off" - ONLY state, nothing else
-    // Using string format "off" instead of object to prevent HA from adding attributes
-    const entities: Record<string, string> = {};
-    for (const light of lightsToInclude) {
-      entities[light.entity_id] = "off";
-    }
+    // Blackout is a DYNAMIC scene - it always turns off ALL lights at activation time
+    // We save it with a special marker, not a fixed list of lights
+    // This way new lights added to the system will also be turned off
 
     // Find or create Blackout scene via config API
     const scenes = await getScenes();
@@ -1948,22 +2000,23 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
 
     const sceneId = existingBlackout?.attributes.id || generateSceneId();
 
-    // Save via config API with minimal entity data (just "off" string)
+    // Save with dynamic blackout marker - entities will be populated at activation time
     const sceneConfig: SceneConfig = {
       id: sceneId,
       name: "Blackout",
-      entities: entities,
+      entities: {}, // Empty - will be filled dynamically on activation
       metadata: {
         mode: "exclusive",
+        dynamicBlackout: true, // Special marker for dynamic behavior
       },
     };
 
     await saveSceneConfig(sceneConfig);
 
     // Backup locally
-    backupScene(sceneId, "Blackout", "exclusive", entities);
+    backupScene(sceneId, "Blackout", "exclusive", {});
 
-    sceneMessage = `'Blackout' scene ${existingBlackout ? "updated" : "created"} (${lightsToInclude.length} lights). `;
+    sceneMessage = `'Blackout' scene ${existingBlackout ? "updated" : "created"} (dynamic - will turn off ALL lights when activated). `;
   }
 
   // Add exclusion info to message
@@ -2657,7 +2710,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "scene_update":
         result = await handleUpdateScene(
-          args as { entity_id: string; entity_ids?: string[] }
+          args as { entity_id: string; entity_ids?: string[]; mode?: "exclusive" | "additive" }
         );
         break;
       case "scene_blackout":
