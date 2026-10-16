@@ -2,267 +2,128 @@
 
 [![npm version](https://img.shields.io/npm/v/ha-mcp-server.svg)](https://www.npmjs.com/package/ha-mcp-server)
 [![CI](https://github.com/Koneisto/HomeAssistant-Light-MCP/actions/workflows/ci.yml/badge.svg)](https://github.com/Koneisto/HomeAssistant-Light-MCP/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Model Context Protocol (MCP) server for controlling Home Assistant lights and managing scenes. Complements the official Home Assistant MCP by providing detailed light control with colors and scene management.
+A local **stdio MCP server** for Home Assistant light control and locally managed lighting scenes. It provides 13 tools for inspecting lights, adjusting color and brightness, and creating, backing up and repairing lighting scenes. MIT licensed; maintained by [Koneisto](https://github.com/Koneisto).
 
-> **Like this project?** Give it a ⭐ on GitHub and help others discover it!
+## Requirements
 
-## Design Philosophy: Lights Only
+- Node.js 22 or newer. The supported CI matrix is Node.js 22, 24 and 26.
+- A reachable Home Assistant instance with its REST API and a long-lived access token.
+- An MCP client that can launch a local stdio process. HTTP-only clients cannot connect directly.
 
-This MCP **intentionally controls only lights** - not switches, not other entities. This is a deliberate safety decision:
+The server uses `light.*` targets for device control. Light changes can still affect people, plants and automations. Review the target list, especially before a blackout or exclusive scene activation. The Home Assistant token may have broader permissions than these tools; this process is not a token permission boundary.
 
-- **Switches can control critical systems** - HVAC, heaters, air conditioning, water pumps
-- **Accidental activation could be dangerous** - turning on a heater while away, disabling AC in summer
-- **Lights are safe** - worst case is lights turn on/off unexpectedly
+## Install and connect
 
-If you need to control switches or other entities, use the official Home Assistant MCP or automations with appropriate safeguards.
+Pin a version so updates are deliberate:
 
-## Features
-
-- **Show Lights** - View all lights with full details:
-  - State, brightness, RGB colors, color temperature
-  - Color mode and supported modes
-  - Available effects (colorloop, etc.)
-  - Color temperature range (min/max Kelvin)
-- **Adjust Light** - Control lights (on/off, brightness, RGB color, color temperature, effects)
-- **Create Scene** - Save current lighting as a scene with two modes:
-  - `exclusive` - Turns off other lights when activated
-  - `additive` - Only affects lights in the scene
-- **List Scenes** - View all saved scenes
-- **Activate Scene** - Activate a saved scene (with IKEA Tradfri support)
-- **Update Scene** - Update an existing scene with current light states
-- **Delete Scene** - Remove a scene
-- **Blackout** - Turn off all lights (with optional exclusions)
-
-## Why This MCP?
-
-The official Home Assistant MCP is limited - it can't show light colors or provide detailed state information. This MCP fills that gap:
-
-| Feature | Official HA MCP | This MCP |
-|---------|-----------------|----------|
-| Show light colors | No | Yes |
-| Show brightness | Limited | Full detail |
-| Show color modes | No | Yes |
-| Show effects | No | Yes |
-| Set RGB colors | No | Yes |
-| Color temperature | No | Yes |
-| Set effects | No | Yes |
-| Create scenes | No | Yes |
-| IKEA Tradfri fixes | No | Yes |
-
-## Installation
-
-```bash
-npm install -g ha-mcp-server
+```sh
+npm install -g ha-mcp-server@0.8.0
 ```
 
-Or clone and build:
-```bash
-git clone https://github.com/Koneisto/HomeAssistant-Light-MCP.git
-cd HomeAssistant-Light-MCP
-npm install
-npm run build
-```
+Configure your client's local stdio server launcher. This is an example JSON format; use your client's documented format and secret handling:
 
-## Configuration
-
-Add to your MCP client configuration:
-
-### Claude Desktop
-
-Edit config file:
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-**Option 1: Using npx (recommended, no global install needed)**
-```json
-{
-  "mcpServers": {
-    "ha-light-scenes": {
-      "command": "npx",
-      "args": ["-y", "ha-mcp-server"],
-      "env": {
-        "HA_URL": "http://your-home-assistant-ip:8123",
-        "HA_TOKEN": "your-long-lived-access-token"
-      }
-    }
-  }
-}
-```
-
-**Option 2: Global install**
-```bash
-npm install -g ha-mcp-server
-```
 ```json
 {
   "mcpServers": {
     "ha-light-scenes": {
       "command": "ha-mcp-server",
       "env": {
-        "HA_URL": "http://your-home-assistant-ip:8123",
-        "HA_TOKEN": "your-long-lived-access-token"
+        "HA_URL": "https://home-assistant.example.invalid",
+        "HA_TOKEN": "<supply-through-your-client-secret-configuration>"
       }
     }
   }
 }
 ```
 
-### Other MCP Clients
+Alternatively set `command` to `npx` and `args` to `["-y", "ha-mcp-server@0.8.0"]`. An initial npx run needs registry access. Restart or reload your MCP client after installing or changing configuration. A terminal started without MCP input may simply wait on stdin; the server is not a web application.
 
-The same configuration structure works with any MCP-compatible client.
+Create a long-lived token in your Home Assistant user profile. Prefer injecting both `HA_URL` and `HA_TOKEN` through the client's protected environment. Do not paste real tokens into conversations, issues, logs or checked-in JSON. The optional `scene_configure` tool persists connection settings locally and puts its token in tool-call input, so environment configuration is preferable. See [security](SECURITY.md).
 
-### Get your Home Assistant token
+Start with `scene_show_lights`, `scene_list`, and passive `scene_diagnose`. These checks do not switch lights. Success confirms basic connectivity, not every bulb's behavior.
 
-1. Go to Home Assistant → Profile (bottom left)
-2. Scroll to "Long-Lived Access Tokens"
-3. Click "Create Token"
-4. Copy the token
+## Tools
 
-## Usage Examples
+All mutating calls require the JSON boolean `user_confirmed: true`. Strings such as `"true"` and `"false"` are rejected. This parameter is a client assertion; it cannot prove that a person approved a call. Configure approval rules in your client. Tool annotations are hints, not access controls.
 
-### Show lights
-> "Show me all the lights"
+| Tool | Purpose and important inputs |
+|---|---|
+| `scene_configure` | Save `url` and `token` locally. Prefer environment configuration. |
+| `scene_show_lights` | Read light states, brightness, color mode, effects and Kelvin limits; optional `filter`. |
+| `scene_adjust_light` | Adjust one verified `light.*` entity using `entity_id`, `state`, brightness, RGB, Kelvin or effect. Does not save a scene. |
+| `scene_create` | Save current light settings under `name`, with explicit `mode`; optional `entity_ids` and `icon`. |
+| `scene_list` | List scenes currently present in Home Assistant. Listing does not grant ownership or list missing backup-only scenes. |
+| `scene_activate` | Apply verified light configuration for `entity_id`. Unreadable or mixed-device scene configurations are refused. |
+| `scene_update` | Save current lighting to an owned scene; `entity_id`, optional `entity_ids` and `mode`. |
+| `scene_delete` | Delete an owned Home Assistant scene. Retains local recovery data. |
+| `scene_blackout` | Turn off lights, optionally excluding targets with `exclude`; `create_scene` can save a dynamic blackout. |
+| `scene_diagnose` | Inspect states and scene configuration. Default is passive. `test_connectivity: true` changes lights and requires confirmation. |
+| `scene_fix` | Preview repairs, recovery, light-only copies or scene tests by default (`dry_run: true`). Apply a reviewed change or activate a test with `dry_run: false`. See [migration](docs/UPGRADING.md). |
+| `scene_sync` | Refresh locally owned scene backups from Home Assistant. Writes local data and requires confirmation. |
+| `scene_history` | Read summaries of retained pre-update/pre-delete snapshots; optional `scene_id` and `limit`. |
 
-> "What lights are on?"
+The server validates inputs before executing requests. Use brightness 0–255 or percentage 0–100, three integer RGB components 0–255, and Kelvin within the light's advertised range. Do not combine alternative brightness or color representations. Use the live tool schemas returned by `tools/list` for exact required fields and allowed combinations.
 
-### Control lights
-> "Turn on living room light"
+Example adjustment, after the user has requested the change and the entity has been verified:
 
-> "Set bedroom to 50% brightness"
+```json
+{
+  "entity_id": "light.example",
+  "state": "on",
+  "brightness_pct": 40,
+  "user_confirmed": true
+}
+```
 
-> "Make the kitchen light red"
+This example changes a light when sent to `scene_adjust_light`; it is not a read-only connectivity test.
 
-> "Set studio lights to warm white"
+## Scene behavior
 
-> "Start colorloop on the hallway light"
+**Additive** scenes change their stored lights and leave other lights alone. **Exclusive** scenes also turn off lights outside the selected lighting configuration; their scope can be the whole Home Assistant light inventory. Choose the mode deliberately. Adjusting a light does not automatically update saved scenes.
 
-### Create a scene
-> "Save this as Movie Night"
+Only scenes tracked as created or explicitly copied by this installation are writable through scene update, repair and delete. A friendly name, scene ID pattern or Home Assistant metadata does not establish ownership. External scenes remain external, including scenes containing switches or other domains. A readable external scene containing only lights can be applied additively, without granting ownership or accepting its exclusive/blackout metadata. No fallback activates an unreadable whole Home Assistant scene.
 
-### Activate a scene
-> "Activate Movie Night"
+Dynamic blackout configuration is retained across backup and activation and resolves the current light inventory when activated. Newly added lights can therefore be affected. The `exclude` patterns apply to the immediate blackout call; they are not saved in the dynamic blackout scene. Activating that saved scene turns off all current lights. Review the live inventory before use.
 
-### Update a scene
-> "Update Evening Lights with current settings"
+Older `color_temp` values in mireds are converted to `color_temp_kelvin` when restoring lighting configuration. The `color_temp` color-mode name remains valid; it is distinct from the deprecated service parameter. Home Assistant describes the change in its [light feature removal notice](https://developers.home-assistant.io/blog/2026/02/23/remove-deprecate-light-features/).
 
-### Blackout
-> "Turn off all lights"
+Scene application can require several device requests. It is not a transaction: some lights may change before another fails. IKEA/Tradfri mode-switch sequencing can help supported devices, but does not guarantee hardware timing or state convergence. On an error or timeout, inspect current states before retrying; cancellation cannot undo a request already accepted by Home Assistant.
 
-> "Turn off all lights except the balcony"
+## Backup and upgrades
 
-## Tools Reference
+Backups are separated by normalized Home Assistant URL:
 
-| Tool | Description |
-|------|-------------|
-| `scene_show_lights` | Show all lights with state, brightness, colors, effects, color modes |
-| `scene_adjust_light` | Control a light (on/off, brightness, color, effects) |
-| `scene_create` | Create a new scene from current light states |
-| `scene_list` | List all scenes |
-| `scene_activate` | Activate a scene |
-| `scene_update` | Update existing scene with current lights |
-| `scene_delete` | Delete a scene |
-| `scene_blackout` | Turn off all lights (supports exclusions) |
-| `scene_diagnose` | Diagnose lights and scenes, check connectivity |
-| `scene_fix` | Fix scene problems, restore from backup |
-| `scene_configure` | Set Home Assistant URL and token |
+```text
+~/.config/ha-mcp-server/instances/<URL-SHA256>/scenes-backup.json
+```
 
-### Light Properties
+The URL key separates endpoints, not physical installations: changing the URL selects another backup store. Private directories and files use POSIX modes 0700 and 0600 where supported. Writes use a lock and atomic replacement. Invalid JSON is reported rather than silently replaced with an empty backup. These local files are recovery aids, not independent off-device backups.
 
-`scene_show_lights` returns:
-- `state` - on/off
-- `brightness` / `brightness_pct` - 0-255 / 0-100%
-- `rgb_color` - [R, G, B] values
-- `color_temp_kelvin` - Color temperature
-- `color_mode` - Current mode (xy, color_temp, rgb, hs)
-- `supported_color_modes` - What the light supports
-- `effect` - Active effect (if any)
-- `effect_list` - Available effects
-- `color_temp_range` - Min/max Kelvin (if supported)
+**Upgrading from 0.7.x requires explicit review of legacy scenes.** The old shared `scenes-backup.json` does not establish ownership in 0.8.0. Read [upgrade and recovery instructions](docs/UPGRADING.md) before restoring, migrating or changing endpoint URLs.
 
-## Scene Modes
+## Troubleshooting
 
-- **Exclusive**: Turns off all lights not in the scene. Good for room-specific scenes.
-- **Additive**: Only affects lights in the scene. Good for accent lighting.
+| Symptom | Check |
+|---|---|
+| Server will not launch | Check Node version, executable path and the client's stderr log. Keep stdout reserved for MCP. |
+| Unauthorized / connection failed | Verify the endpoint, network reachability and token validity; configure both environment variables together. Do not publish logs containing credentials. |
+| Invalid arguments / confirmation required | Use the current tool schema and actual JSON booleans; older clients may need to refresh tool definitions. |
+| Scene is not owned | Import a new light-only copy explicitly; do not edit backup ownership fields. |
+| Scene cannot be verified | Restore access to its configuration or use a reviewed local copy. Whole-scene fallback is intentionally blocked. |
+| Timeout or partial failure | Read current light states before another mutation. A failed response is not proof nothing changed. |
+| Corrupt backup / lock failure | Preserve the files, stop competing processes, and follow [recovery](docs/UPGRADING.md). |
 
-## Local Backup & Multi-Instance Support
+## Relationship to Home Assistant's official MCP
 
-This MCP maintains a local backup of scenes you create:
-- **Automatic backup**: Scenes are saved to `~/.config/ha-mcp-server/scenes-backup.json`
-- **Multi-instance aware**: Detects when another MCP instance (or HA UI) modifies scenes
-- **Smart conflict resolution**: Merges changes from multiple sources
-- **Restore capability**: Can restore scenes if Home Assistant loses them
+The [official integration](https://www.home-assistant.io/integrations/mcp_server/) exposes the tools of its configured LLM APIs. Its capabilities and entity exposure depend on Home Assistant configuration and version. This project instead provides a local stdio interface with a fixed set of light and scene tools and local scene backups. Choose based on the interface and controls you need; there is no blanket claim that the official integration lacks color or brightness support.
 
-### Diagnostics (`scene_diagnose`)
+## Development
 
-Analyzes your lights and scenes to identify problems:
-- Tests light connectivity and response times
-- Detects connection types (Zigbee, WiFi, Bluetooth)
-- Finds scenes with null values or missing lights
-- Compares Home Assistant state with local backup
-- Reports new lights not yet in exclusive scenes
+```sh
+npm ci
+npm run build
+npm test
+```
 
-Example: *"Run diagnostics on my lights"*
-
-### Fix & Repair (`scene_fix`)
-
-Four actions to repair scene problems:
-
-| Action | Description |
-|--------|-------------|
-| `fix_all` | Auto-fix all scenes: remove null values, add missing lights to exclusive scenes |
-| `fix_scene` | Fix a specific scene by name |
-| `test_scene` | Activate a scene and report what went wrong |
-| `restore_from_backup` | Restore scenes from local backup if Home Assistant lost them |
-
-Example: *"Fix all my scenes"* or *"Restore Evening Lights from backup"*
-
-## IKEA Tradfri Support
-
-IKEA Tradfri lights have a known issue when switching between RGB color mode and color temperature (Kelvin) mode. The bulbs need time to process the mode change before accepting brightness or color values.
-
-**Note:** Home Assistant's native scenes don't work reliably with Tradfri lights due to these timing issues. This MCP provides a workaround by managing scenes independently with proper delays.
-
-This MCP automatically handles Tradfri lights by:
-- Detecting Tradfri devices by manufacturer name
-- Adding a 500ms delay between mode switch and subsequent commands
-- Properly sequencing color/temperature changes with brightness adjustments
-
-Without these fixes, Tradfri lights often ignore commands or produce incorrect colors when switching modes.
-
-## Security
-
-### Your Data Stays Local
-- All communication happens directly between your computer and your Home Assistant instance
-- No data is sent to external servers or third parties
-- The MCP server runs locally on your machine via stdio (no open network ports)
-
-### No Tracking
-- We don't care enough to track you
-
-### Token Safety
-- Your Home Assistant token is stored only on your local machine
-- Use environment variables to avoid storing tokens in files
-- The token is only sent to your own Home Assistant instance
-- You can revoke the token anytime from Home Assistant settings
-
-### What This Server Can Access
-- Only lights and scenes in your Home Assistant
-- Cannot access other Home Assistant entities (sensors, locks, cameras, etc.)
-- Cannot make changes outside of light control and scene management
-
-## Contributing
-
-Found a bug or have an idea? [Open an issue](https://github.com/Koneisto/HomeAssistant-Light-MCP/issues) or submit a pull request!
-
-## License
-
-MIT - Use freely, attribution appreciated but not required.
-
-## Author
-
-[Koneisto](https://github.com/Koneisto)
-
----
-*Built by people with questionable priorities*
+Tests use isolated fixtures and mocked Home Assistant requests. They do not establish compatibility with every Home Assistant version or physical light. See [development and release checks](docs/DEVELOPMENT.md) for validation and rollback expectations. Report ordinary bugs through [GitHub issues](https://github.com/Koneisto/HomeAssistant-Light-MCP/issues), with versions and redacted reproduction steps. Report security issues as described in [SECURITY.md](SECURITY.md).
