@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -15,7 +15,7 @@ const light = (id = 'light.lamp', attributes = {}, state = 'on') => ({ entity_id
 const scene = (id = 'external', name = 'External') => ({ entity_id: `scene.${id.replaceAll("-", "_")}`, state: '2026-10-16', attributes: { id, friendly_name: name } });
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 async function setup(states = [light()], configs = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'ha-mcp-core-')); homes.push(home);
+  const home = mkdtempSync(join(realpathSync(tmpdir()), 'ha-mcp-core-')); homes.push(home);
   process.env.HOME = home; process.env.HA_URL = 'http://ha.invalid:8123'; process.env.HA_TOKEN = 'unit-test-only';
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -151,7 +151,7 @@ test('read cancellation stops retry backoff without issuing a second request',as
   await assert.rejects(api.haFetch('/api/states',{},20),/cancelled/); assert.equal(calls,1);
 });
 test('backup isolation, permissions, transaction locks, corrupt JSON and wrong-instance fail closed',()=>{
-  const root=mkdtempSync(join(tmpdir(),'ha-mcp-store-')); homes.push(root);
+  const root=mkdtempSync(join(realpathSync(tmpdir()),'ha-mcp-store-')); homes.push(root);
   const validate=data=>{assert.equal(data.version,2);assert.equal(typeof data.instance,'string');};
   const a=new BackupStorage(root,'http://one.invalid/',validate),same=new BackupStorage(root,'http://one.invalid',validate),b=new BackupStorage(root,'http://two.invalid',validate);
   assert.equal(a.file,same.file); assert.notEqual(a.file,b.file);
@@ -181,7 +181,7 @@ test('external all-light scene containing unavailable targets fails before switc
 });
 test('source permission policy rejects symlink ancestors before creating instance directory',async()=>{
   const {symlinkSync}=await import('node:fs');
-  const root=mkdtempSync(join(tmpdir(),'ha-mcp-links-')); homes.push(root); const real=join(root,'real');mkdirSync(real);symlinkSync(real,join(root,'alias'),'dir');
+  const root=mkdtempSync(join(realpathSync(tmpdir()),'ha-mcp-links-')); homes.push(root); const real=join(root,'real');mkdirSync(real);symlinkSync(real,join(root,'alias'),'dir');
   const store=new BackupStorage(join(root,'alias','config'),'http://ha.invalid',()=>{});
   assert.throws(()=>store.transaction(()=>{}),/Unsafe configuration directory ancestor/); assert.equal(existsSync(join(real,'config')),false);
 });
@@ -194,7 +194,7 @@ test('real HTTP timeout closes an in-flight service request; redirects do not re
     writes++; req.on('close',()=>closed++); // Never return a response.
   });await new Promise(r=>source.listen(0,'127.0.0.1',r));
   try{
-    const home=mkdtempSync(join(tmpdir(),'ha-mcp-http-'));homes.push(home);process.env.HOME=home;process.env.HA_URL=`http://127.0.0.1:${source.address().port}`;process.env.HA_TOKEN='test-not-secret';globalThis.fetch=originalFetch;
+    const home=mkdtempSync(join(realpathSync(tmpdir()),'ha-mcp-http-'));homes.push(home);process.env.HOME=home;process.env.HA_URL=`http://127.0.0.1:${source.address().port}`;process.env.HA_TOKEN='test-not-secret';globalThis.fetch=originalFetch;
     const api=await import(`${pathToFileURL(join(process.cwd(),'dist/index.js')).href}?real-http=${homes.length}`);
     await assert.rejects(api.callService('light','turn_off',{entity_id:'light.lamp'},150),/outcome uncertain/);
     await new Promise(r=>setTimeout(r,40));assert.equal(writes,1);assert.equal(closed,1);
@@ -204,14 +204,14 @@ test('real HTTP timeout closes an in-flight service request; redirects do not re
 
 test('atomic serialization failure preserves last valid backup and removes temporary/lock files',async()=>{
   const {readdirSync}=await import('node:fs');
-  const root=mkdtempSync(join(tmpdir(),'ha-mcp-failure-'));homes.push(root);const store=new BackupStorage(root,'http://ha.invalid',()=>{});
+  const root=mkdtempSync(join(realpathSync(tmpdir()),'ha-mcp-failure-'));homes.push(root);const store=new BackupStorage(root,'http://ha.invalid',()=>{});
   store.transaction(value=>{value.scenes.one={ok:true};});const before=readFileSync(store.file,'utf8');
   assert.throws(()=>store.transaction(value=>{value.scenes.two={unserializable:1n};}),/BigInt/);
   assert.equal(readFileSync(store.file,'utf8'),before);assert.deepEqual(readdirSync(join(root,'instances',store.instance)),['scenes-backup.json']);
 });
 test('independent processes serialize complete backup transactions without lost scenes',async()=>{
   const {spawn}=await import('node:child_process');
-  const root=mkdtempSync(join(tmpdir(),'ha-mcp-writers-'));homes.push(root);
+  const root=mkdtempSync(join(realpathSync(tmpdir()),'ha-mcp-writers-'));homes.push(root);
   const script=`import {BackupStorage} from ${JSON.stringify(pathToFileURL(join(process.cwd(),'dist/storage.js')).href)};const store=new BackupStorage(process.argv[1],'http://ha.invalid',()=>{});for(let i=0;i<10;i++){let done=false;for(let attempt=0;attempt<100;attempt++){try{store.transaction(s=>{s.scenes[process.argv[2]+'-'+i]={value:i};});done=true;break;}catch(e){if(!e.message.includes('locked'))throw e;await new Promise(r=>setTimeout(r,5));}}if(!done)throw new Error('lock retry exhausted');}`;
   const run=label=>new Promise((resolve,reject)=>{const child=spawn(process.execPath,['--input-type=module','-e',script,root,label],{stdio:['ignore','ignore','pipe']});let error='';child.stderr.on('data',data=>error+=data);child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(error||`writer exit ${code}`)));});
   await Promise.all([run('a'),run('b'),run('c')]);

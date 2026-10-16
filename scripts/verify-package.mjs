@@ -1,10 +1,10 @@
 import {spawnSync} from 'node:child_process';
-import {mkdtempSync,readFileSync,rmSync,existsSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync,existsSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import assert from 'node:assert/strict';
 import {smoke} from './protocol-smoke.mjs';
-const work=mkdtempSync(join(tmpdir(),'ha-mcp-package-'));const pkg=JSON.parse(readFileSync('package.json'));
+const work=realpathSync(mkdtempSync(join(tmpdir(),'ha-mcp-package-')));const pkg=JSON.parse(readFileSync('package.json'));
 function run(args,opts={}){const r=spawnSync('npm',args,{encoding:'utf8',...opts});assert.ifError(r.error);assert.equal(r.status,0,r.stderr||r.stdout);return r.stdout;}
 try{
  run(['run','build']);

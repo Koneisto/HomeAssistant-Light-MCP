@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {mkdtemp,rm,readFile} from 'node:fs/promises';
+import {mkdtemp,rm,readFile,realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 
 test('real HTTP round trip preserves external scenes and owned recovery lifecycle',async()=>{
- const home=await mkdtemp(join(tmpdir(),'ha-mcp-http-'));
+ const home=await realpath(await mkdtemp(join(tmpdir(),'ha-mcp-http-')));
  const previous={HOME:process.env.HOME,HA_URL:process.env.HA_URL,HA_TOKEN:process.env.HA_TOKEN};
  const light={entity_id:'light.lamp',state:'on',attributes:{friendly_name:'Fixture lamp',brightness:55,color_mode:'color_temp',color_temp_kelvin:2700,rgb_color:[255,166,80],supported_color_modes:['color_temp','rgb'],min_color_temp_kelvin:2000,max_color_temp_kelvin:6500}};
  const configs={external:{id:'external',name:'External',entities:{'light.lamp':{state:'on'},'switch.fan':'on'}}};const calls=[];

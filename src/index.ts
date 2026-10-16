@@ -18,7 +18,7 @@ import { join } from "path";
 import { homedir } from "os";
 
 // Store config in user's home directory so it persists across npx runs
-const CONFIG_DIR = join(homedir(), ".config", "ha-mcp-server");
+const CONFIG_DIR = join(realpathSync(homedir()), ".config", "ha-mcp-server");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const SCENES_BACKUP_FILE = join(CONFIG_DIR, "scenes-backup.json");
 

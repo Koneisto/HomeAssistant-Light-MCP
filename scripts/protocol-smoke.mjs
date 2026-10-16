@@ -1,10 +1,10 @@
 import {spawn} from 'node:child_process';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {mkdtemp,rm,realpath} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import assert from 'node:assert/strict';
 export async function smoke(entry, version='0.8.0', extraCalls=[]) {
- const home=await mkdtemp(join(tmpdir(),'ha-mcp-smoke-'));
+ const home=await realpath(await mkdtemp(join(tmpdir(),'ha-mcp-smoke-')));
  const child=spawn(process.execPath,[entry],{env:{...process.env,HOME:home,USERPROFILE:home,HA_URL:'',HA_TOKEN:''},stdio:['pipe','pipe','pipe']});
  let stdout='',stderr='';const replies=new Map();
  const messages=[{jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'package-verification',version:'1'}}},{jsonrpc:'2.0',method:'notifications/initialized'},{jsonrpc:'2.0',id:2,method:'tools/list'},...extraCalls.map((params,i)=>({jsonrpc:'2.0',id:i+3,method:'tools/call',params}))];

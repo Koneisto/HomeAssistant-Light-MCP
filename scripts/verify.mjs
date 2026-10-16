@@ -1,12 +1,12 @@
 import {spawnSync} from 'node:child_process';
 import assert from 'node:assert/strict';
-import {readFileSync,mkdtempSync,rmSync} from 'node:fs';
+import {readFileSync,mkdtempSync,rmSync,realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 const npmEnv=Object.fromEntries(Object.entries(process.env).filter(([key])=>!/^npm_config_allow_scripts$/i.test(key)));
 function run(args){const r=spawnSync('npm',args,{stdio:'inherit',env:npmEnv});assert.ifError(r.error);assert.equal(r.status,0,'npm '+args.join(' ')+' failed');}
 run(['test']);
-const docsHome=mkdtempSync(join(tmpdir(),'ha-mcp-docs-'));
+const docsHome=realpathSync(mkdtempSync(join(tmpdir(),'ha-mcp-docs-')));
 try { const docs=spawnSync(process.execPath,['scripts/verify-docs.mjs'],{stdio:'inherit',env:{...process.env,HA_URL:'',HA_TOKEN:'',HOME:docsHome}});assert.ifError(docs.error);assert.equal(docs.status,0,'Documentation verification failed'); } finally {rmSync(docsHome,{recursive:true,force:true});}
 const result=spawnSync('npm',['audit','--json'],{encoding:'utf8',env:npmEnv});
 assert.ifError(result.error);

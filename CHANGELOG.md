@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [0.8.0] - 2026-10-16
 
+- Normalize OS-managed home/temporary path aliases without allowing symlinked application data directories; validate macOS alongside Linux.
+
 ### Changed
 - Require Node.js 22 or newer; support Node.js 22, 24 and 26 in CI.
 - Validate tool arguments at runtime; require boolean confirmation for mutations, including scene storage and synchronization.

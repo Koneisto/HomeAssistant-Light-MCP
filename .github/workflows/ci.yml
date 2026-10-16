@@ -15,13 +15,17 @@ concurrency:
 
 jobs:
   verify:
-    name: Node ${{ matrix.node }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        node: [22, 24, 26]
+        include:
+          - {node: 22, os: ubuntu-latest, label: Node 22}
+          - {node: 24, os: ubuntu-latest, label: Node 24}
+          - {node: 26, os: ubuntu-latest, label: Node 26}
+          - {node: 26, os: macos-latest, label: macOS Node 26}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

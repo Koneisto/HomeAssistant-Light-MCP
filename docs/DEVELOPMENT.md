@@ -1,6 +1,6 @@
 # Development and release validation
 
-Use Node.js 22, 24 or 26. Install the committed dependency tree with `npm ci`, build with `npm run build`, and run `npm test`. Tests must use isolated configuration directories and a mock Home Assistant server; never supply production credentials to a test harness.
+Use Node.js 22, 24 or 26. CI checks Linux on all three versions and macOS on Node 26. Install the committed dependency tree with `npm ci`, build with `npm run build`, and run `npm test`. Tests must use isolated configuration directories and a mock Home Assistant server; never supply production credentials to a test harness.
 
 ## Review checklist
 
@@ -30,3 +30,5 @@ Passing mock tests does not prove physical bulb timing or every Home Assistant r
 Inventory each launcher and installation separately: global packages, pinned npx launchers, source checkouts and containerized or remote consumers can use different versions. Record the current command, package version and protected data backup before changing it. Install the verified artifact, reload the consuming client and perform passive protocol/read checks. Preserve endpoint identities and secrets; do not replace unrelated client configuration.
 
 For failures, stop the affected writer, preserve diagnostic output with secrets redacted, and use the package plus matching configuration/data backup to roll back. See [upgrade and recovery](UPGRADING.md).
+
+The npm release workflow uses a repository- and workflow-specific trusted OIDC publisher. It runs only for a `v<package-version>` tag and creates provenance; no long-lived npm publish token is stored in GitHub. Configure the package trust before pushing the release tag. Keep tag names immutable.
