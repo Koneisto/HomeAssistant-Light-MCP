@@ -7,17 +7,25 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, chmodSync, realpathSync, lstatSync } from "node:fs";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { BackupStorage, atomicWrite, hashConfig, normalizedURL, privateDirectory } from "./storage.js";
+export { hashConfig } from "./storage.js";
 import { join } from "path";
 import { homedir } from "os";
 
 // Store config in user's home directory so it persists across npx runs
-const CONFIG_DIR = join(homedir(), ".config", "ha-mcp-server");
+const CONFIG_DIR = join(realpathSync(homedir()), ".config", "ha-mcp-server");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 const SCENES_BACKUP_FILE = join(CONFIG_DIR, "scenes-backup.json");
 
 // Local backup of scenes created/managed by this MCP
 interface LocalSceneBackup {
+  owned: true;
+  dynamicBlackout?: boolean;
   name: string;
   mode: "exclusive" | "additive";
   entities: Record<string, Record<string, unknown> | string>;
@@ -31,18 +39,6 @@ interface LocalSceneBackup {
 // Generate a unique instance ID for this MCP process
 const MCP_INSTANCE_ID = `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-// Simple hash function for comparing configs
-function hashConfig(entities: Record<string, unknown>): string {
-  const sorted = JSON.stringify(entities, Object.keys(entities).sort());
-  let hash = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const char = sorted.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32bit integer
-  }
-  return hash.toString(16);
-}
-
 // Snapshot of a scene before modification
 interface SceneSnapshot {
   sceneId: string;
@@ -54,68 +50,54 @@ interface SceneSnapshot {
 
 interface ScenesBackupStore {
   version: number;
+  instance: string;
   scenes: Record<string, LocalSceneBackup>; // keyed by scene ID
   snapshots?: SceneSnapshot[];              // History of changes for recovery
 }
 
-function loadScenesBackup(): ScenesBackupStore {
-  if (existsSync(SCENES_BACKUP_FILE)) {
-    try {
-      return JSON.parse(readFileSync(SCENES_BACKUP_FILE, "utf-8"));
-    } catch {
-      // ignore
-    }
+function validateBackup(data: unknown): asserts data is ScenesBackupStore {
+  if (!data || typeof data !== "object") throw new Error("Invalid backup schema");
+  const d = data as ScenesBackupStore;
+  if (d.version !== 2 || typeof d.instance !== "string" || !d.scenes || typeof d.scenes !== "object" || Array.isArray(d.scenes)) throw new Error("Invalid backup schema/version");
+  for (const [id, scene] of Object.entries(d.scenes)) {
+    validateSceneId(id);
+    if (!scene || scene.owned !== true || typeof scene.name !== "string" || !["exclusive", "additive"].includes(scene.mode) || typeof scene.createdAt !== "string" || typeof scene.updatedAt !== "string" || (scene.dynamicBlackout !== undefined && typeof scene.dynamicBlackout !== "boolean")) throw new Error("Invalid scene backup");
+    assertLightEntities(scene.entities);
   }
-  return { version: 1, scenes: {} };
-}
-
-function saveScenesBackup(store: ScenesBackupStore): void {
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-  }
-  writeFileSync(SCENES_BACKUP_FILE, JSON.stringify(store, null, 2));
-}
-
-function backupScene(sceneId: string, name: string, mode: "exclusive" | "additive", entities: Record<string, Record<string, unknown> | string>): void {
-  const store = loadScenesBackup();
-  const now = new Date().toISOString();
-  const hash = hashConfig(entities as Record<string, unknown>);
-
-  if (store.scenes[sceneId]) {
-    // Update existing
-    store.scenes[sceneId].name = name;
-    store.scenes[sceneId].mode = mode;
-    store.scenes[sceneId].entities = entities;
-    store.scenes[sceneId].updatedAt = now;
-    store.scenes[sceneId].lastKnownHAHash = hash;
-    store.scenes[sceneId].instanceId = MCP_INSTANCE_ID;
-  } else {
-    // New scene
-    store.scenes[sceneId] = {
-      name,
-      mode,
-      entities,
-      createdAt: now,
-      updatedAt: now,
-      lastKnownHAHash: hash,
-      instanceId: MCP_INSTANCE_ID,
-    };
-  }
-
-  saveScenesBackup(store);
-}
-
-function removeSceneBackup(sceneId: string): void {
-  const store = loadScenesBackup();
-  if (store.scenes[sceneId]) {
-    delete store.scenes[sceneId];
-    saveScenesBackup(store);
+  if (d.snapshots !== undefined && !Array.isArray(d.snapshots)) throw new Error("Invalid snapshot schema");
+  for (const item of d.snapshots || []) {
+    if (!item || typeof item.name !== "string" || typeof item.timestamp !== "string" || !["update", "delete"].includes(item.operation)) throw new Error("Invalid snapshot");
+    validateSceneId(item.sceneId); assertLightEntities(item.entities);
   }
 }
-
+function storage(): BackupStorage<ScenesBackupStore> {
+  if (!config.ha_url) throw new Error("Home Assistant is not configured");
+  return new BackupStorage(CONFIG_DIR, config.ha_url, validateBackup);
+}
+function loadScenesBackup(): ScenesBackupStore { return storage().read(); }
+function backupScene(sceneId: string, name: string, mode: "exclusive" | "additive", entities: SceneConfig["entities"], dynamicBlackout = false): void {
+  assertLightEntities(entities);
+  storage().transaction(store => {
+    const now = new Date().toISOString();
+    store.scenes[sceneId] = { owned: true, name, mode, entities: Object.fromEntries(Object.entries(entities).map(([id, value]) => [id, typeof value === "string" ? value : normalizeLightConfig(value)])), dynamicBlackout, createdAt: store.scenes[sceneId]?.createdAt || now, updatedAt: now, lastKnownHAHash: hashConfig(entities), instanceId: MCP_INSTANCE_ID };
+  });
+}
+function requireOwned(id: string): LocalSceneBackup {
+  const backup = getSceneBackup(id);
+  if (!backup?.owned) throw new Error("External scene is read-only; use scene_fix action=import_scene to create an owned copy");
+  return backup;
+}
+function validateSceneId(id: string): void { if (typeof id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(id)) throw new Error("Invalid scene config ID"); }
+function assertLightEntities(entities: SceneConfig["entities"]): void {
+  if (!entities || typeof entities !== "object" || Array.isArray(entities)) throw new Error("Invalid scene entities");
+  for (const [id, value] of Object.entries(entities)) {
+    validateEntityId(id, "light");
+    if (typeof value === "string" ? !["on", "off"].includes(value) : !value || typeof value !== "object" || Array.isArray(value) || !["on", "off"].includes(value.state as string)) throw new Error(`Invalid state for ${id}`);
+  }
+}
 function getSceneBackup(sceneId: string): LocalSceneBackup | null {
   const store = loadScenesBackup();
-  return store.scenes[sceneId] || null;
+  return Object.hasOwn(store.scenes, sceneId) ? store.scenes[sceneId] : null;
 }
 
 function getAllSceneBackups(): Record<string, LocalSceneBackup> {
@@ -128,29 +110,9 @@ const MAX_SNAPSHOTS = 20;
 
 // Save a snapshot of scene state before modification
 function saveSceneSnapshot(sceneId: string, name: string, entities: Record<string, Record<string, unknown> | string>, operation: "update" | "delete"): void {
-  const store = loadScenesBackup();
-  const snapshot: SceneSnapshot = {
-    sceneId,
-    name,
-    entities,
-    timestamp: new Date().toISOString(),
-    operation,
-  };
-
-  // Initialize snapshots array if needed
-  if (!store.snapshots) {
-    store.snapshots = [];
-  }
-
-  // Add new snapshot at the beginning
-  store.snapshots.unshift(snapshot);
-
-  // Keep only the last MAX_SNAPSHOTS
-  if (store.snapshots.length > MAX_SNAPSHOTS) {
-    store.snapshots = store.snapshots.slice(0, MAX_SNAPSHOTS);
-  }
-
-  saveScenesBackup(store);
+  storage().transaction(store => {
+    store.snapshots = [{ sceneId, name, entities, timestamp: new Date().toISOString(), operation }, ...(store.snapshots || [])].slice(0, MAX_SNAPSHOTS);
+  });
 }
 
 // Get recent snapshots for a scene
@@ -166,51 +128,19 @@ function getSceneSnapshots(sceneId?: string): SceneSnapshot[] {
 // Sync backup from Home Assistant
 // This ensures our local backup reflects the current state in HA
 async function syncBackupFromHA(): Promise<{ synced: number; errors: string[] }> {
-  const errors: string[] = [];
-  let synced = 0;
-
-  try {
-    const scenes = await getScenes();
-    const store = loadScenesBackup();
-    const now = new Date().toISOString();
-
-    for (const scene of scenes) {
-      if (!scene.attributes.id) continue;
-
-      try {
-        const config = await getSceneConfig(scene.attributes.id);
-        if (!config) continue;
-
-        const hash = hashConfig(config.entities as Record<string, unknown>);
-        const existing = store.scenes[scene.attributes.id];
-
-        // Only update if hash changed or doesn't exist locally
-        if (!existing || existing.lastKnownHAHash !== hash) {
-          const mode = (config.metadata?.mode as "exclusive" | "additive") || "exclusive";
-          store.scenes[scene.attributes.id] = {
-            name: config.name,
-            mode,
-            entities: config.entities,
-            createdAt: existing?.createdAt || now,
-            updatedAt: now,
-            lastKnownHAHash: hash,
-            instanceId: existing?.instanceId || MCP_INSTANCE_ID,
-            lastSyncedFromHA: now,
-          };
-          synced++;
-        }
-      } catch (err) {
-        errors.push(`Failed to sync scene ${scene.attributes.id}: ${err instanceof Error ? err.message : String(err)}`);
+  let synced = 0; const errors: string[] = [];
+  const owned = getAllSceneBackups();
+  for (const [id, backup] of Object.entries(owned)) {
+    try {
+      const current = await getSceneConfig(id);
+      if (!current) continue;
+      assertLightEntities(current.entities);
+      if (hashConfig(current.entities) !== backup.lastKnownHAHash || current.name !== backup.name || (current.metadata?.mode === "additive" ? "additive" : "exclusive") !== backup.mode || (current.metadata?.dynamicBlackout === true) !== (backup.dynamicBlackout === true)) {
+        saveSceneSnapshot(id, backup.name, backup.entities, "update");
+        backupScene(id, current.name, current.metadata?.mode === "additive" ? "additive" : "exclusive", current.entities, current.metadata?.dynamicBlackout === true); synced++;
       }
-    }
-
-    if (synced > 0) {
-      saveScenesBackup(store);
-    }
-  } catch (err) {
-    errors.push(`Failed to fetch scenes: ${err instanceof Error ? err.message : String(err)}`);
+    } catch (error) { errors.push(`Scene ${id}: ${error instanceof Error ? error.message : String(error)}`); }
   }
-
   return { synced, errors };
 }
 
@@ -222,9 +152,10 @@ interface Config {
 
 function loadConfig(): Config {
   // First try environment variables
+  if (Boolean(process.env.HA_URL) !== Boolean(process.env.HA_TOKEN)) throw new Error("HA_URL and HA_TOKEN must be supplied together");
   if (process.env.HA_URL && process.env.HA_TOKEN) {
     return {
-      ha_url: process.env.HA_URL,
+      ha_url: normalizedURL(process.env.HA_URL),
       ha_token: process.env.HA_TOKEN,
     };
   }
@@ -232,22 +163,20 @@ function loadConfig(): Config {
   // Then try config file
   if (existsSync(CONFIG_FILE)) {
     try {
-      return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      privateDirectory(CONFIG_DIR);
+      if (lstatSync(CONFIG_FILE).isSymbolicLink()) throw new Error("Unsafe config symlink");
+      const loaded = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      if (typeof loaded.ha_token !== "string" || !loaded.ha_token.trim()) throw new Error("Invalid config token");
+      loaded.ha_url = normalizedURL(loaded.ha_url); chmodSync(CONFIG_FILE, 0o600); return loaded;
     } catch {
-      // ignore
+      throw new Error("Invalid saved configuration; preserve and repair config.json");
     }
   }
 
   return { ha_url: "", ha_token: "" };
 }
 
-function saveConfig(config: Config): void {
-  // Ensure config directory exists
-  if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
-  }
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-}
+function saveConfig(value: Config): void { atomicWrite(CONFIG_FILE, value); }
 
 let config = loadConfig();
 
@@ -376,42 +305,36 @@ interface SceneConfig {
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 
-async function haFetch(endpoint: string, options: RequestInit = {}): Promise<Response> {
-  if (!config.ha_url || !config.ha_token) {
-    throw new Error("Home Assistant not configured. Use the 'configure' tool to set URL and token.");
-  }
-
-  const url = `${config.ha_url}${endpoint}`;
-  const headers = {
-    Authorization: `Bearer ${config.ha_token}`,
-    "Content-Type": "application/json",
-    ...options.headers,
-  };
-
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const response = await fetch(url, { ...options, headers });
-
-      // Retry on 5xx server errors
-      if (response.status >= 500 && attempt < MAX_RETRIES) {
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
-        continue;
+export async function haFetch(endpoint: string, options: RequestInit = {}, timeoutMs = 10000): Promise<Response> {
+  if (!config.ha_url || !config.ha_token) throw new Error("Home Assistant not configured. Set HA_URL and HA_TOKEN.");
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  options.signal?.addEventListener("abort", abort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const timer = setTimeout(abort, timeoutMs);
+  const readOnly = !options.method || options.method === "GET";
+  try {
+    for (let attempt = 1; ; attempt++) {
+      controller.signal.throwIfAborted();
+      try {
+        const response = await fetch(`${config.ha_url}${endpoint}`, { ...options, redirect: "error", headers: { Authorization: `Bearer ${config.ha_token}`, "Content-Type": "application/json" }, signal: controller.signal });
+        // Consume the body while the deadline is active (including stalled response bodies).
+        const body = await response.arrayBuffer();
+        const buffered = new Response(response.status === 204 || response.status === 304 ? null : body, { status: response.status, statusText: response.statusText, headers: response.headers });
+        if (!readOnly || response.status < 500 || attempt >= MAX_RETRIES) return buffered;
+      } catch (error) {
+        if (controller.signal.aborted) throw new Error(readOnly ? "Home Assistant request timed out or was cancelled" : "Home Assistant write timed out or was cancelled; outcome uncertain. Inspect state before retrying.");
+        if (!readOnly) throw new Error("Home Assistant write failed; outcome uncertain. Inspect state before retrying.");
+        if (attempt >= MAX_RETRIES) throw error;
       }
-
-      return response;
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-
-      // Don't retry on last attempt
-      if (attempt < MAX_RETRIES) {
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
-      }
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => { clearTimeout(wait); reject(new Error("Home Assistant request cancelled")); };
+        const wait = setTimeout(() => { controller.signal.removeEventListener("abort", onAbort); resolve(); }, RETRY_DELAY_MS * attempt);
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        if (controller.signal.aborted) onAbort();
+      });
     }
-  }
-
-  throw lastError || new Error(`Failed to fetch ${endpoint} after ${MAX_RETRIES} attempts`);
+  } finally { clearTimeout(timer); options.signal?.removeEventListener("abort", abort); }
 }
 
 async function getLights(): Promise<LightState[]> {
@@ -420,15 +343,19 @@ async function getLights(): Promise<LightState[]> {
     throw new Error(`Failed to fetch states: ${response.statusText}`);
   }
   const states = (await response.json()) as LightState[];
-  return states.filter((s) => s.entity_id.startsWith("light."));
+  if (!Array.isArray(states)) throw new Error("Invalid HA state list");
+  return states.filter(s => typeof s.entity_id === "string" && /^light\.[a-z0-9_]+$/.test(s.entity_id));
 }
 
 async function getLight(entityId: string): Promise<LightState> {
+  validateEntityId(entityId, "light");
   const response = await haFetch(`/api/states/${entityId}`);
   if (!response.ok) {
     throw new Error(`Failed to fetch light state: ${response.statusText}`);
   }
-  return response.json() as Promise<LightState>;
+  const light = await response.json() as LightState;
+  if (light.entity_id !== entityId || !["on", "off"].includes(light.state) || !light.attributes) throw new Error("Light is unavailable or returned an invalid state");
+  return light;
 }
 
 async function getScenes(): Promise<HAScene[]> {
@@ -437,10 +364,12 @@ async function getScenes(): Promise<HAScene[]> {
     throw new Error(`Failed to fetch states: ${response.statusText}`);
   }
   const states = (await response.json()) as HAScene[];
-  return states.filter((s) => s.entity_id.startsWith("scene."));
+  if (!Array.isArray(states)) throw new Error("Invalid HA state list");
+  return states.filter(s => typeof s.entity_id === "string" && /^scene\.[a-z0-9_]+$/.test(s.entity_id));
 }
 
 async function getSceneConfig(sceneId: string): Promise<SceneConfig | null> {
+  validateSceneId(sceneId);
   const response = await haFetch(`/api/config/scene/config/${sceneId}`);
   if (!response.ok) {
     if (response.status === 404) {
@@ -448,86 +377,57 @@ async function getSceneConfig(sceneId: string): Promise<SceneConfig | null> {
     }
     throw new Error(`Failed to fetch scene config: ${response.statusText}`);
   }
-  return response.json() as Promise<SceneConfig>;
+  const result = await response.json() as SceneConfig;
+  if (!result || result.id !== sceneId || typeof result.name !== "string" || !result.entities || typeof result.entities !== "object" || Array.isArray(result.entities)) throw new Error("Invalid HA scene configuration");
+  return result;
 }
 
 async function saveSceneConfig(sceneConfig: SceneConfig): Promise<void> {
+  validateSceneId(sceneConfig.id); requireOwned(sceneConfig.id); assertLightEntities(sceneConfig.entities);
+  sceneConfig = { ...sceneConfig, entities: Object.fromEntries(Object.entries(sceneConfig.entities).map(([id, value]) => [id, typeof value === "string" ? value : normalizeLightConfig(value)])) };
   const response = await haFetch(`/api/config/scene/config/${sceneConfig.id}`, {
     method: "POST",
     body: JSON.stringify(sceneConfig),
   });
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Failed to save scene config: ${response.statusText} - ${errorText}`);
+    throw new Error(`Failed to save scene config (${response.status}); inspect HA before retrying`);
   }
 
   // Reload scenes so the new scene appears as an entity immediately
-  await haFetch("/api/services/scene/reload", {
+  const reload = await haFetch("/api/services/scene/reload", {
     method: "POST",
     body: JSON.stringify({}),
   });
+  if (!reload.ok) throw new Error("Scene change was saved but reload failed; inspect HA before retrying");
 }
 
 async function deleteSceneConfig(sceneId: string): Promise<void> {
+  validateSceneId(sceneId); requireOwned(sceneId);
+  const current = await getSceneConfig(sceneId); if (!current) throw new Error("Scene config is unavailable"); assertLightEntities(current.entities);
   const response = await haFetch(`/api/config/scene/config/${sceneId}`, {
     method: "DELETE",
   });
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Failed to delete scene config: ${response.statusText} - ${errorText}`);
+    throw new Error(`Failed to delete scene config (${response.status}); inspect HA before retrying`);
   }
 
   // Reload scenes so the deleted scene disappears immediately
-  await haFetch("/api/services/scene/reload", {
+  const reload = await haFetch("/api/services/scene/reload", {
     method: "POST",
     body: JSON.stringify({}),
   });
+  if (!reload.ok) throw new Error("Scene change was saved but reload failed; inspect HA before retrying");
 }
 
-// Timeout wrapper for promises
-function withTimeout<T>(promise: Promise<T>, ms: number, errorMsg: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(errorMsg)), ms)
-    )
-  ]);
-}
-
-const SERVICE_TIMEOUT_MS = 5000; // 5 seconds per light operation
-
-async function callService(
-  domain: string,
-  service: string,
-  data: Record<string, unknown>,
-  timeoutMs: number = SERVICE_TIMEOUT_MS
-): Promise<unknown> {
-  const entityInfo = data.entity_id ? ` (${data.entity_id})` : '';
-
-  try {
-    const response = await withTimeout(
-      haFetch(`/api/services/${domain}/${service}`, {
-        method: "POST",
-        body: JSON.stringify(data),
-      }),
-      timeoutMs,
-      `Timeout calling ${domain}.${service}${entityInfo}`
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Failed to call service ${domain}.${service}: ${response.statusText} - ${errorText}`);
-    }
-    return response.json();
-  } catch (error) {
-    // Log timeout/errors but don't fail the entire operation
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes('Timeout')) {
-      console.error(`Warning: ${message} - continuing with other lights`);
-      return null; // Return null to indicate timeout, but don't throw
-    }
-    throw error;
-  }
+const SERVICE_TIMEOUT_MS = 5000;
+export async function callService(domain: string, service: string, data: Record<string, unknown>, timeoutMs = SERVICE_TIMEOUT_MS): Promise<unknown> {
+  if (domain !== "light" || !["turn_on", "turn_off"].includes(service)) throw new Error("Only explicit light on/off services are allowed");
+  const ids = Array.isArray(data.entity_id) ? data.entity_id : [data.entity_id];
+  if (!ids.length) throw new Error("An explicit light target is required");
+  ids.forEach(id => validateEntityId(id as string, "light"));
+  const response = await haFetch(`/api/services/${domain}/${service}`, { method: "POST", body: JSON.stringify(data) }, timeoutMs);
+  if (!response.ok) throw new Error(`Light service failed (${response.status}); inspect state before retrying`);
+  return response.json();
 }
 
 // Tool definitions
@@ -733,7 +633,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_diagnose",
-    description: "Diagnose lights and scenes. Tests connectivity, response times, identifies problems with scenes (null values, missing lights, etc.), and provides recommendations. If test_connectivity=true, REQUIRES user_confirmed=true because it toggles lights.",
+    description: "Diagnose lights and scenes. Tests connectivity, response times, identifies problems with scenes (null values, missing lights, etc.), and provides recommendations. If test_connectivity=true, REQUIRES user_confirmed=true because it changes light states and requests restoration.",
     inputSchema: {
       type: "object",
       properties: {
@@ -743,21 +643,21 @@ const tools: Tool[] = [
         },
         user_confirmed: {
           type: "boolean",
-          description: "REQUIRED when test_connectivity=true: Must be true to confirm user explicitly allowed light toggle tests. Without confirmation, connectivity tests are skipped.",
+          description: "REQUIRED when test_connectivity=true: Must be true to confirm user explicitly allowed light toggle tests. Without confirmation, the request is rejected.",
         },
       },
     },
   },
   {
     name: "scene_fix",
-    description: "Fix problems found by scene_diagnose. Can fix null values, add missing lights to exclusive scenes, restore from backup, or interactively test and fix a specific scene. test_scene action REQUIRES user_confirmed=true because it changes lights.",
+    description: "Fix problems found by scene_diagnose. Can fix null values, add missing lights to exclusive scenes, restore from backup, or interactively test and fix a specific scene. All actions require user_confirmed=true. dry_run defaults true, including test_scene.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
           enum: ["fix_all", "fix_scene", "test_scene", "restore_from_backup"],
-          description: "Action to perform: 'fix_all' fixes all auto-fixable issues, 'fix_scene' fixes a specific scene, 'test_scene' activates a scene and asks user what went wrong (REQUIRES user_confirmed), 'restore_from_backup' restores scenes from local backup.",
+          description: "Action to perform: 'fix_all' fixes all auto-fixable issues, 'fix_scene' fixes a specific scene, 'test_scene' previews an activation (dry_run=false activates), 'restore_from_backup' restores scenes from local backup.",
         },
         scene_name: {
           type: "string",
@@ -778,7 +678,7 @@ const tools: Tool[] = [
   },
   {
     name: "scene_sync",
-    description: "Sync local backup with Home Assistant. Fetches all scenes from HA and updates local backup to match. Useful for ensuring backup is current before making changes.",
+    description: "Sync local backups of owned light-only scenes from Home Assistant. External scenes are never adopted. Useful for ensuring backup is current before making changes.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -803,15 +703,49 @@ const tools: Tool[] = [
   },
 ];
 
-// Helper to generate unique ID (UUID v4)
-function generateSceneId(): string {
-  // Generate UUID v4 without external dependencies
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
+const passiveTools = new Set(["scene_show_lights", "scene_list", "scene_history", "scene_diagnose"]);
+for (const tool of tools) {
+  tool.inputSchema.additionalProperties = false;
+  tool.annotations = { readOnlyHint: passiveTools.has(tool.name) && tool.name !== "scene_diagnose", destructiveHint: !passiveTools.has(tool.name) || tool.name === "scene_diagnose", idempotentHint: false, openWorldHint: true };
+  if (!passiveTools.has(tool.name)) {
+    tool.inputSchema.properties = { ...tool.inputSchema.properties, user_confirmed: { type: "boolean", description: "Must be literal true after the user explicitly requested this operation; client is responsible for obtaining consent." } };
+    tool.inputSchema.required = [...new Set([...(tool.inputSchema.required || []), "user_confirmed"])];
+    tool.description += " Requires explicit user confirmation (user_confirmed=true).";
+  }
+  if (tool.name === "scene_fix") {
+    const props = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
+    props.action.enum = ["fix_all", "fix_scene", "test_scene", "restore_from_backup", "import_scene", "migrate_legacy"];
+    props.dry_run = { type: "boolean", description: "Default true: preview repairs, recovery or light-only copy. Set false after reviewing preview to apply. test_scene also previews by default." };
+    tool.description = "Preview or repair owned light-only scenes. External scenes are read-only. import_scene or migrate_legacy creates a fresh light-only owned copy. dry_run defaults true, including test_scene. Requires user_confirmed=true.";
+  }
 }
+export { tools };
+function validateArguments(name: string, input: unknown): Record<string, unknown> {
+  const tool = tools.find(t => t.name === name); if (!tool) throw new Error(`Unknown tool: ${name}`);
+  const args = input ?? {};
+  if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Arguments must be an object");
+  const values = args as Record<string, unknown>;
+  const props = tool.inputSchema.properties as Record<string, { type: string; enum?: unknown[]; items?: { type: string }; minItems?: number; maxItems?: number; minimum?: number; maximum?: number }>;
+  for (const key of tool.inputSchema.required || []) if (values[key] === undefined) throw new Error(`Missing ${key}`);
+  for (const [key, value] of Object.entries(values)) {
+    const schema = props[key]; if (!schema) throw new Error(`Unknown argument: ${key}`);
+    if (schema.type === "array") {
+      if (!Array.isArray(value) || value.length > 10000 || (schema.minItems !== undefined && value.length < schema.minItems) || (schema.maxItems !== undefined && value.length > schema.maxItems) || value.some(v => typeof v !== schema.items?.type)) throw new Error(`Invalid ${key}`);
+    } else if (typeof value !== schema.type || (schema.type === "number" && !Number.isFinite(value))) throw new Error(`Invalid ${key}`);
+    if (schema.enum && !schema.enum.includes(value)) throw new Error(`Invalid ${key}`);
+    if (schema.type === "number") numeric(value, schema.minimum ?? -Infinity, schema.maximum ?? Infinity, key);
+    if (schema.type === "string" && (!(value as string).trim() || (value as string).length > 16384)) throw new Error(`Invalid ${key}`);
+  }
+  if (!passiveTools.has(name) || (name === "scene_diagnose" && values.test_connectivity === true)) if (values.user_confirmed !== true) throw new Error("Explicit user confirmation requires boolean user_confirmed=true");
+  if (name === "scene_adjust_light") { validateEntityId(values.entity_id as string, "light"); validateLightParameters(values); }
+  for (const id of (values.entity_ids as string[] || [])) validateEntityId(id, "light");
+  if (values.limit !== undefined) numeric(values.limit, 1, 20, "limit", true);
+  if (name === "scene_configure") normalizedURL(values.url as string);
+  return values;
+}
+
+// Helper to generate unique ID (UUID v4)
+function generateSceneId(): string { return randomUUID(); }
 
 // Input validation helpers
 function isValidEntityId(entityId: string): boolean {
@@ -820,8 +754,8 @@ function isValidEntityId(entityId: string): boolean {
   return /^[a-z_]+\.[a-z0-9_]+$/i.test(entityId);
 }
 
-function validateEntityId(entityId: string): void {
-  if (!isValidEntityId(entityId)) {
+function validateEntityId(entityId: string, domain?: "light" | "scene"): void {
+  if (typeof entityId !== "string" || !isValidEntityId(entityId) || (domain && !entityId.startsWith(`${domain}.`))) {
     throw new Error(`Invalid entity_id format: ${entityId}`);
   }
 }
@@ -847,6 +781,51 @@ const SCENE_ATTRIBUTES = [
   'friendly_name', 'off_with_transition', 'off_brightness'
 ] as const;
 
+export function normalizeLightConfig(raw: Record<string, unknown>): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Invalid light config");
+  const value = { ...raw };
+  if (value.color_temp_kelvin === undefined && value.color_temp !== undefined) {
+    if (typeof value.color_temp !== "number" || !Number.isFinite(value.color_temp) || value.color_temp <= 0) throw new Error("Invalid legacy mired value");
+    value.color_temp_kelvin = Math.round(1000000 / value.color_temp);
+  }
+  delete value.color_temp;
+  const colors = ["rgb_color", "rgbw_color", "rgbww_color", "hs_color", "xy_color", "color_temp_kelvin"];
+  const modeKey: Record<string, string> = { color_temp: "color_temp_kelvin", rgb: "rgb_color", rgbw: "rgbw_color", rgbww: "rgbww_color", hs: "hs_color", xy: "xy_color" };
+  const active = modeKey[value.color_mode as string] || colors.find(k => value[k] !== undefined);
+  for (const key of colors) if (key !== active) delete value[key];
+  return value;
+}
+function sceneServiceParameters(raw: Record<string, unknown>): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  for (const key of ["brightness", "rgb_color", "rgbw_color", "rgbww_color", "hs_color", "xy_color", "color_temp_kelvin", "effect"]) if (raw[key] !== undefined) params[key] = raw[key];
+  return params;
+}
+function numeric(value: unknown, min: number, max: number, name: string, integer = false): void {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) throw new Error(`Invalid ${name}: expected ${integer ? "integer" : "number"} ${min}..${max}`);
+}
+export function validateLightParameters(args: Record<string, unknown>, light?: LightState): void {
+  if (args.brightness !== undefined) numeric(args.brightness, 0, 255, "brightness", true);
+  if (args.brightness_pct !== undefined) numeric(args.brightness_pct, 0, 100, "brightness_pct");
+  if (args.brightness !== undefined && args.brightness_pct !== undefined) throw new Error("Choose brightness or brightness_pct");
+  const shapes: Record<string, number[]> = { rgb_color: [255, 255, 255], rgbw_color: [255, 255, 255, 255], rgbww_color: [255, 255, 255, 255, 255], hs_color: [360, 100], xy_color: [1, 1] };
+  for (const [key, ranges] of Object.entries(shapes)) if (args[key] !== undefined) {
+    const values = args[key]; if (!Array.isArray(values) || values.length !== ranges.length) throw new Error(`Invalid ${key}`);
+    ranges.forEach((max, i) => numeric(values[i], 0, max, key, key.startsWith("rgb")));
+  }
+  const colorKeys = [...Object.keys(shapes), "color_temp_kelvin"].filter(k => args[k] !== undefined);
+  if (colorKeys.length > 1) throw new Error("Choose one color representation");
+  if (args.state !== undefined && !["on", "off"].includes(args.state as string)) throw new Error("Invalid light state");
+  if (args.state === "off" && Object.keys(args).some(k => ["brightness", "brightness_pct", ...Object.keys(shapes), "color_temp_kelvin", "effect"].includes(k))) throw new Error("Off state cannot include on parameters");
+  if (args.color_temp_kelvin !== undefined) {
+    const attrs = light?.attributes;
+    const min = attrs?.min_color_temp_kelvin ?? (attrs?.max_mireds ? Math.round(1000000 / attrs.max_mireds) : 1);
+    const max = attrs?.max_color_temp_kelvin ?? (attrs?.min_mireds ? Math.round(1000000 / attrs.min_mireds) : 100000);
+    numeric(args.color_temp_kelvin, min, max, "color_temp_kelvin", true);
+    if (attrs?.supported_color_modes && !attrs.supported_color_modes.includes("color_temp")) throw new Error("Light does not support color temperature");
+  }
+  if (args.effect !== undefined && (typeof args.effect !== "string" || !args.effect.length || (light?.attributes.effect_list && !light.attributes.effect_list.includes(args.effect)))) throw new Error("Unsupported light effect");
+}
+
 // Helper to build entity config from current state
 function buildEntityConfig(light: LightState): Record<string, unknown> {
   const attrs = light.attributes as Record<string, unknown>;
@@ -861,7 +840,7 @@ function buildEntityConfig(light: LightState): Record<string, unknown> {
     }
   }
 
-  return entityConfig;
+  return normalizeLightConfig(entityConfig);
 }
 
 // Tool handlers
@@ -874,7 +853,7 @@ async function handleConfigure(args: { url: string; token: string }): Promise<st
   }
 
   // Test connection
-  const testConfig = { ha_url: url, ha_token: token };
+  const testConfig = { ha_url: normalizedURL(url), ha_token: token };
   const oldConfig = config;
   config = testConfig;
 
@@ -893,6 +872,7 @@ async function handleConfigure(args: { url: string; token: string }): Promise<st
 
     // Save config
     saveConfig(testConfig);
+    deviceInfoCache.clear();
     return `Successfully connected to Home Assistant at ${url}. Configuration saved.`;
   } catch (error) {
     config = oldConfig;
@@ -926,7 +906,7 @@ async function handleGetLights(args: { filter?: string }): Promise<string> {
       entity_id: l.entity_id,
       name: attrs.friendly_name,
       state: l.state,
-      brightness_pct: attrs.brightness
+      brightness_pct: attrs.brightness !== undefined
         ? Math.round((attrs.brightness / 255) * 100)
         : null,
       color_mode: colorMode,
@@ -1098,60 +1078,24 @@ async function getLightManufacturer(entityId: string): Promise<string | null> {
 
 // Test light response time - toggle and measure
 async function testLightResponseTime(entityId: string): Promise<{ responseTime: number; success: boolean; error?: string }> {
-  const startTime = Date.now();
-
+  const started = Date.now();
   try {
-    // Get current state
-    const beforeState = await getLight(entityId);
-    const wasOn = beforeState.state === "on";
-
-    // Toggle light
-    if (wasOn) {
-      await callService("light", "turn_off", { entity_id: entityId });
-    } else {
-      await callService("light", "turn_on", { entity_id: entityId });
-    }
-
-    // Wait a bit and check if state changed
-    await delay(100);
-
-    // Poll for state change (max 2 seconds)
-    const maxWait = 2000;
-    const pollInterval = 50;
-    let elapsed = 100;
-
-    while (elapsed < maxWait) {
-      const afterState = await getLight(entityId);
-      const isNowOn = afterState.state === "on";
-
-      if (isNowOn !== wasOn) {
-        // State changed - restore original state
-        if (wasOn) {
-          await callService("light", "turn_on", { entity_id: entityId });
-        } else {
-          await callService("light", "turn_off", { entity_id: entityId });
-        }
-
-        return { responseTime: Date.now() - startTime, success: true };
+    const before = await getLight(entityId);
+    const wasOn = before.state === "on";
+    await callService("light", wasOn ? "turn_off" : "turn_on", { entity_id: entityId });
+    // Once the write was acknowledged, restore in finally even if reading state fails.
+    let changed = false;
+    try {
+      for (let elapsed = 0; elapsed < 2000; elapsed += 100) {
+        await delay(100); const after = await getLight(entityId);
+        if ((after.state === "on") !== wasOn) { changed = true; break; }
       }
-
-      await delay(pollInterval);
-      elapsed += pollInterval;
+    } finally {
+      const params = sceneServiceParameters(normalizeLightConfig(buildEntityConfig(before)));
+      await callService("light", wasOn ? "turn_on" : "turn_off", { entity_id: entityId, ...(wasOn ? params : {}) });
     }
-
-    // Timeout - try to restore anyway
-    if (wasOn) {
-      await callService("light", "turn_on", { entity_id: entityId });
-    }
-
-    return { responseTime: Date.now() - startTime, success: false, error: "Timeout - no response" };
-  } catch (error) {
-    return {
-      responseTime: Date.now() - startTime,
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error"
-    };
-  }
+    return { responseTime: Date.now() - started, success: changed, ...(changed ? {} : { error: "No observed state change; restoration requested" }) };
+  } catch (error) { return { responseTime: Date.now() - started, success: false, error: error instanceof Error ? error.message : "Unknown error" }; }
 }
 
 // Helper to detect IKEA Tradfri lights (checks manufacturer first, then entity_id as fallback)
@@ -1189,11 +1133,13 @@ async function handleSetLight(args: {
   const { entity_id, state, brightness, brightness_pct, rgb_color, color_temp_kelvin, effect, user_confirmed } = args;
 
   // Safety check: require explicit user confirmation
-  if (!user_confirmed) {
+  if (user_confirmed !== true) {
     return "BLOCKED: Light changes require explicit user confirmation. Set user_confirmed=true only when user has explicitly requested this light change.";
   }
 
-  validateEntityId(entity_id);
+  validateEntityId(entity_id, "light");
+  const target = await getLight(entity_id);
+  validateLightParameters(args, target);
 
   if (state === "off") {
     await callService("light", "turn_off", { entity_id });
@@ -1288,6 +1234,8 @@ async function handleCreateScene(args: {
   // Get all lights from Home Assistant
   const allLights = await getLights();
 
+  if (entity_ids) for (const id of entity_ids) if (!allLights.some(l => l.entity_id === id && ["on", "off"].includes(l.state))) throw new Error(`Light ${id} is missing or unavailable`);
+
   // Determine which lights to capture as "on" with their current state
   let lightsOn: LightState[];
 
@@ -1336,11 +1284,11 @@ async function handleCreateScene(args: {
     sceneConfig.icon = icon;
   }
 
-  // Save to Home Assistant
+  // Register only this freshly generated ID before the remote write.
+  backupScene(sceneId, name, mode, entities);
   await saveSceneConfig(sceneConfig);
 
-  // Backup locally for resilience
-  backupScene(sceneId, name, mode, entities);
+  // The local recovery record was written before the remote create.
 
   const modeDescription = mode === "exclusive"
     ? "other lights will be turned off when activated"
@@ -1383,202 +1331,26 @@ async function handleListScenes(): Promise<string> {
 }
 
 async function handleActivateScene(args: { entity_id: string; user_confirmed?: boolean }): Promise<string> {
-  let { entity_id, user_confirmed } = args;
-
-  // Safety check: require explicit user confirmation
-  if (!user_confirmed) {
-    return "BLOCKED: Scene activation requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested this scene activation.";
-  }
-
-  // Add scene. prefix if not present
-  if (!entity_id.startsWith("scene.")) {
-    entity_id = `scene.${entity_id}`;
-  }
-
-  validateEntityId(entity_id);
-
-  // Get current system state
+  if (args.user_confirmed !== true) throw new Error("Explicit user confirmation is required");
+  const entityId = args.entity_id.startsWith("scene.") ? args.entity_id : `scene.${args.entity_id}`;
+  validateEntityId(entityId, "scene");
   const allLights = await getLights();
-  const allLightIds = new Set(allLights.map((l) => l.entity_id));
-  const scenes = await getScenes();
-  const scene = scenes.find((s) => s.entity_id === entity_id);
-
-  // Also try to find by name (more user-friendly)
-  const sceneByName = scenes.find(
-    (s) => s.attributes.friendly_name?.toLowerCase() === entity_id.replace("scene.", "").toLowerCase()
-  );
-  const targetScene = scene || sceneByName;
-
-  if (!targetScene) {
-    // Scene not in HA - check local backup
-    const backups = getAllSceneBackups();
-    const backupByName = Object.entries(backups).find(
-      ([, b]) => b.name.toLowerCase() === entity_id.replace("scene.", "").replace(/_/g, " ").toLowerCase()
-    );
-
-    if (backupByName) {
-      // Scene exists in backup but not HA - activate directly from backup
-      const [backupId, backup] = backupByName;
-      const allLights = await getLights();
-      const allLightIds = new Set(allLights.map((l) => l.entity_id));
-
-      // Filter entities to only include lights that still exist
-      const validEntities: Record<string, Record<string, unknown> | string> = {};
-      for (const [lightId, config] of Object.entries(backup.entities)) {
-        if (allLightIds.has(lightId)) {
-          validEntities[lightId] = config;
-        }
-      }
-
-      // Add missing lights as "off" for exclusive mode
-      if (backup.mode === "exclusive") {
-        for (const light of allLights) {
-          if (!validEntities[light.entity_id]) {
-            validEntities[light.entity_id] = "off";
-          }
-        }
-      }
-
-      const workingConfig: SceneConfig = {
-        id: backupId,
-        name: backup.name,
-        entities: validEntities,
-        metadata: { mode: backup.mode },
-      };
-
-      return await activateSceneFromConfig(workingConfig, allLights, `[Activated from local backup - scene not in HA] `);
-    }
-
-    return `Scene "${entity_id}" not found in Home Assistant or local backup.`;
+  const scene = (await getScenes()).find(s => s.entity_id === entityId);
+  let current: SceneConfig | null = null;
+  if (scene?.attributes.id) current = await getSceneConfig(scene.attributes.id);
+  if (scene && !current) throw new Error("Scene contents cannot be verified; activation blocked");
+  if (!scene) {
+    const item = Object.entries(getAllSceneBackups()).find(([, b]) => b.name.toLowerCase().replace(/ /g, "_") === entityId.slice(6).toLowerCase());
+    if (!item) throw new Error("Scene not found");
+    const [id, backup] = item;
+    current = { id, name: backup.name, entities: backup.entities, metadata: { mode: backup.mode, dynamicBlackout: backup.dynamicBlackout } };
   }
-
-  const configId = targetScene.attributes.id;
-
-  // Get HA config and local backup
-  let haConfig: SceneConfig | null = null;
-  let localBackup: LocalSceneBackup | null = null;
-
-  if (configId) {
-    haConfig = await getSceneConfig(configId);
-    localBackup = getSceneBackup(configId);
-  }
-
-  // Determine the authoritative config with multi-instance conflict detection
-  let mode: "exclusive" | "additive" = "exclusive";
-  let entities: Record<string, Record<string, unknown> | string> = {};
-  let healingDetails: string[] = [];
-  let conflictDetected = false;
-
-  if (localBackup && haConfig) {
-    // Both exist - check for conflicts (another instance may have modified HA)
-    const currentHAHash = hashConfig(haConfig.entities as Record<string, unknown>);
-    const lastKnownHash = localBackup.lastKnownHAHash;
-
-    if (lastKnownHash && currentHAHash !== lastKnownHash) {
-      // HA has changed since our last sync - another instance modified it!
-      conflictDetected = true;
-
-      // Smart merge strategy:
-      // 1. Get lights from both sources
-      const localLights = new Set(Object.keys(localBackup.entities));
-      const haLights = new Set(Object.keys(haConfig.entities));
-
-      // 2. Find differences
-      const onlyInLocal = [...localLights].filter(l => !haLights.has(l));
-      const onlyInHA = [...haLights].filter(l => !localLights.has(l));
-      const inBoth = [...localLights].filter(l => haLights.has(l));
-
-      // 3. Merge: prefer HA for shared lights (it's more recent), keep unique lights from both
-      entities = {};
-
-      // Lights in both - use HA config (more recent from another instance)
-      for (const lightId of inBoth) {
-        if (allLightIds.has(lightId)) {
-          entities[lightId] = haConfig.entities[lightId];
-        }
-      }
-
-      // Lights only in HA - another instance added them
-      for (const lightId of onlyInHA) {
-        if (allLightIds.has(lightId)) {
-          entities[lightId] = haConfig.entities[lightId];
-          healingDetails.push(`merged from other instance: ${lightId}`);
-        }
-      }
-
-      // Lights only in local - we had them, HA doesn't (maybe removed by other instance or old)
-      for (const lightId of onlyInLocal) {
-        if (allLightIds.has(lightId)) {
-          // Check if light still exists in system
-          entities[lightId] = localBackup.entities[lightId];
-          healingDetails.push(`kept local: ${lightId}`);
-        }
-      }
-
-      // Use HA's mode if different (another instance may have changed it)
-      mode = (haConfig.metadata?.mode as "exclusive" | "additive") || localBackup.mode;
-
-      healingDetails.unshift(`CONFLICT: HA modified by another instance, merged configs`);
-    } else {
-      // No conflict - use local backup as source of truth
-      mode = localBackup.mode;
-      entities = { ...localBackup.entities };
-    }
-  } else if (localBackup) {
-    // Only local backup exists (HA lost the scene?)
-    mode = localBackup.mode;
-    entities = { ...localBackup.entities };
-    healingDetails.push(`restored from backup (missing in HA)`);
-  } else if (haConfig) {
-    // Only HA config exists (new scene from another instance or legacy)
-    mode = (haConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
-    entities = { ...haConfig.entities };
-    healingDetails.push(`imported from HA (created by another instance or UI)`);
-  } else {
-    // No config at all - fallback to basic HA activation
-    await callService("scene", "turn_on", { entity_id: targetScene.entity_id });
-    return `Activated scene "${targetScene.entity_id}" (no detailed config available)`;
-  }
-
-  // Adapt to current light situation
-  const entityKeys = Object.keys(entities);
-
-  // Remove lights that no longer exist in system
-  for (const lightId of entityKeys) {
-    if (!allLightIds.has(lightId)) {
-      delete entities[lightId];
-      healingDetails.push(`removed ${lightId} (no longer in system)`);
-    }
-  }
-
-  // Add new lights for exclusive mode
-  if (mode === "exclusive") {
-    for (const light of allLights) {
-      if (!entities[light.entity_id]) {
-        entities[light.entity_id] = "off";
-        healingDetails.push(`added ${light.attributes.friendly_name || light.entity_id} (new light → off)`);
-      }
-    }
-  }
-
-  // DO NOT auto-update HA or local backup during activation!
-  // Only report issues - let user decide to fix with scene_fix or scene_update
-
-  // Build working config for activation (use merged entities for THIS activation only)
-  const workingConfig: SceneConfig = {
-    id: configId || generateSceneId(),
-    name: localBackup?.name || haConfig?.name || entity_id,
-    entities,
-    metadata: { mode },
-  };
-
-  // Build info message about detected issues (but don't fix them)
-  let issueInfo = "";
-  if (healingDetails.length > 0) {
-    issueInfo = `[Issues detected: ${healingDetails.join("; ")}. Use scene_fix to repair.] `;
-  }
-
-  return await activateSceneFromConfig(workingConfig, allLights, issueInfo);
+  if (!current) throw new Error("Scene configuration unavailable");
+  assertLightEntities(current.entities);
+  const owned = !!getSceneBackup(current.id);
+  // External light-only scenes can be activated, but cannot claim exclusive/blackout semantics.
+  const working = { ...current, entities: { ...current.entities }, metadata: owned ? { ...current.metadata } : { mode: "additive" } };
+  return activateSceneFromConfig(working, allLights);
 }
 
 // Helper function to actually activate a scene from config
@@ -1587,201 +1359,42 @@ async function activateSceneFromConfig(
   allLights: LightState[],
   prefixMessage: string = ""
 ): Promise<string> {
-  const mode = (sceneConfig.metadata?.mode as "exclusive" | "additive") || "exclusive";
-  const isDynamicBlackout = sceneConfig.metadata?.dynamicBlackout === true;
-
-  // DYNAMIC BLACKOUT: Simply turn off ALL lights, ignore stored entities
-  if (isDynamicBlackout) {
-    const lightsOn = allLights
-      .filter((l) => l.state === "on")
-      .map((l) => l.entity_id);
-
-    if (lightsOn.length === 0) {
-      return `${prefixMessage}Blackout: All ${allLights.length} lights are already off.`;
-    }
-
-    await callService("light", "turn_off", { entity_id: lightsOn });
-    return `${prefixMessage}Blackout: Turned off ${lightsOn.length} lights (${allLights.length} total in system).`;
+  assertLightEntities(sceneConfig.entities);
+  const available = new Map(allLights.map(l => [l.entity_id, l]));
+  for (const id of Object.keys(sceneConfig.entities)) if (!available.has(id)) throw new Error(`Light ${id} is missing; activation blocked before any changes`);
+  const dynamic = sceneConfig.metadata?.dynamicBlackout === true;
+  const exclusive = sceneConfig.metadata?.mode === "exclusive";
+  // Validate every applicable entity before making the first change.
+  const entries = Object.entries(sceneConfig.entities).filter(([id]) => available.has(id)).map(([id, raw]) => {
+    if (!["on", "off"].includes(available.get(id)!.state)) throw new Error(`Light ${id} is unavailable; activation blocked before any changes`);
+    const value = typeof raw === "string" ? { state: raw } : normalizeLightConfig(raw);
+    const params = sceneServiceParameters(value);
+    validateLightParameters(params, available.get(id)!);
+    return { id, value, params };
+  });
+  if (dynamic) {
+    const targets = allLights.filter(l => l.state === "on").map(l => l.entity_id);
+    if (targets.length) await callService("light", "turn_off", { entity_id: targets });
+    return `${prefixMessage}Blackout: requested off for ${targets.length} lights.`;
   }
-
-  const sceneEntityIds = Object.keys(sceneConfig.entities);
-
-  // In exclusive mode: turn off ALL lights first
-  if (mode === "exclusive") {
-    const lightsOn = allLights
-      .filter((l) => l.state === "on")
-      .map((l) => l.entity_id);
-
-    if (lightsOn.length > 0) {
-      await callService("light", "turn_off", { entity_id: lightsOn });
+  if (exclusive) {
+    const targets = allLights.filter(l => l.state === "on" && !entries.some(e => e.id === l.entity_id && e.value.state !== "off")).map(l => l.entity_id);
+    if (targets.length) await callService("light", "turn_off", { entity_id: targets });
+  }
+  for (const { id, value, params } of entries) {
+    if (value.state === "off") { await callService("light", "turn_off", { entity_id: id }); continue; }
+    const ikea = await isIkeaLight(id, await getLightManufacturer(id));
+    const colorKeys = ["rgb_color", "rgbw_color", "rgbww_color", "hs_color", "xy_color", "color_temp_kelvin"];
+    const colorKey = colorKeys.find(key => params[key] !== undefined);
+    if (ikea && colorKey) {
+      await callService("light", "turn_on", { entity_id: id, [colorKey]: params[colorKey] });
       await delay(500);
-    }
+      const rest = { ...params }; delete rest[colorKey];
+      if (Object.keys(rest).length) await callService("light", "turn_on", { entity_id: id, ...rest });
+    } else await callService("light", "turn_on", { entity_id: id, ...params });
+    await delay(RATE_LIMIT_DELAY_MS);
   }
-
-  // Build list of IKEA vs non-IKEA lights
-  const ikeaLights: string[] = [];
-  const standardLights: string[] = [];
-
-  for (const lightId of sceneEntityIds as string[]) {
-    const manufacturer = await getLightManufacturer(lightId);
-    if (await isIkeaLight(lightId, manufacturer)) {
-      ikeaLights.push(lightId);
-    } else {
-      standardLights.push(lightId);
-    }
-  }
-
-  let lightsSet = 0;
-
-  // Set each standard light explicitly with full state (color + brightness)
-  for (let i = 0; i < standardLights.length; i++) {
-    const lightId = standardLights[i];
-    const lightConfigRaw = sceneConfig.entities[lightId];
-    if (!lightConfigRaw) continue;
-
-    // Handle simple string format ("off" or "on") vs object format
-    if (typeof lightConfigRaw === "string") {
-      if (lightConfigRaw === "off") {
-        await callService("light", "turn_off", { entity_id: lightId });
-      } else {
-        await callService("light", "turn_on", { entity_id: lightId });
-      }
-      lightsSet++;
-      continue;
-    }
-
-    const lightConfig = lightConfigRaw;
-
-    // Rate limiting between lights
-    if (i > 0) {
-      await delay(RATE_LIMIT_DELAY_MS);
-    }
-
-    if (lightConfig.state === "off") {
-      await callService("light", "turn_off", { entity_id: lightId });
-      lightsSet++;
-      continue;
-    }
-
-    // Build service data with all relevant attributes
-    const serviceData: Record<string, unknown> = { entity_id: lightId };
-
-    // Color: prefer rgb_color, then color_temp_kelvin, then color_temp
-    if (lightConfig.rgb_color !== undefined) {
-      serviceData.rgb_color = lightConfig.rgb_color;
-    } else if (lightConfig.color_temp_kelvin !== undefined) {
-      serviceData.color_temp_kelvin = lightConfig.color_temp_kelvin;
-    } else if (lightConfig.color_temp !== undefined) {
-      serviceData.color_temp = lightConfig.color_temp;
-    }
-
-    // Brightness
-    if (lightConfig.brightness !== undefined) {
-      serviceData.brightness = lightConfig.brightness;
-    }
-
-    await callService("light", "turn_on", serviceData);
-    lightsSet++;
-  }
-
-  // Handle IKEA lights with split commands (color mode first, then brightness)
-  for (let i = 0; i < ikeaLights.length; i++) {
-    const lightId = ikeaLights[i];
-    const lightConfigRaw = sceneConfig.entities[lightId];
-    if (!lightConfigRaw) continue;
-
-    // Handle simple string format ("off" or "on") vs object format
-    if (typeof lightConfigRaw === "string") {
-      if (lightConfigRaw === "off") {
-        await callService("light", "turn_off", { entity_id: lightId });
-      } else {
-        await callService("light", "turn_on", { entity_id: lightId });
-      }
-      lightsSet++;
-      continue;
-    }
-
-    const lightConfig = lightConfigRaw;
-
-    // Rate limiting between lights
-    if (lightsSet > 0 || i > 0) {
-      await delay(RATE_LIMIT_DELAY_MS);
-    }
-
-    if (lightConfig.state === "off") {
-      await callService("light", "turn_off", { entity_id: lightId });
-      lightsSet++;
-      continue;
-    }
-
-    const hasRgb = lightConfig.rgb_color !== undefined;
-    const hasColorTemp = lightConfig.color_temp_kelvin !== undefined || lightConfig.color_temp !== undefined;
-
-    if (hasRgb || hasColorTemp) {
-      // First call: set color mode (RGB or color_temp)
-      const colorData: Record<string, unknown> = { entity_id: lightId };
-      if (hasRgb) {
-        colorData.rgb_color = lightConfig.rgb_color;
-      } else if (lightConfig.color_temp_kelvin !== undefined) {
-        colorData.color_temp_kelvin = lightConfig.color_temp_kelvin;
-      } else if (lightConfig.color_temp !== undefined) {
-        colorData.color_temp = lightConfig.color_temp;
-      }
-      await callService("light", "turn_on", colorData);
-
-      // Wait for IKEA light to switch color mode
-      await delay(500);
-
-      // Second call: brightness
-      if (lightConfig.brightness !== undefined) {
-        await callService("light", "turn_on", {
-          entity_id: lightId,
-          brightness: lightConfig.brightness
-        });
-      }
-    } else {
-      // No color info, just set brightness
-      const serviceData: Record<string, unknown> = { entity_id: lightId };
-      if (lightConfig.brightness !== undefined) {
-        serviceData.brightness = lightConfig.brightness;
-      }
-      await callService("light", "turn_on", serviceData);
-    }
-    lightsSet++;
-  }
-
-  // Final verification for exclusive mode: ensure only scene lights are on
-  // This catches lights that didn't respond or were slow to turn off
-  let extraTurnedOff = 0;
-  if (mode === "exclusive") {
-    await delay(300); // Wait for scene lights to settle
-    const currentLights = await getLights();
-
-    // Find lights that are ON but should be OFF (not in scene, or in scene with state "off")
-    const shouldBeOff = currentLights.filter((l) => {
-      if (l.state !== "on") return false;
-
-      // If not in scene, should be off
-      if (!sceneEntityIds.includes(l.entity_id)) return true;
-
-      // If in scene, check if scene wants it off
-      const sceneState = sceneConfig?.entities?.[l.entity_id];
-      if (typeof sceneState === "string" && sceneState === "off") return true;
-      if (typeof sceneState === "object" && sceneState?.state === "off") return true;
-
-      return false;
-    }).map((l) => l.entity_id);
-
-    if (shouldBeOff.length > 0) {
-      await callService("light", "turn_off", { entity_id: shouldBeOff });
-      extraTurnedOff = shouldBeOff.length;
-    }
-  }
-
-  const modeInfo = mode === "exclusive" ? " (exclusive)" : "";
-  const ikeaInfo = ikeaLights.length > 0 ? ` (${ikeaLights.length} IKEA)` : "";
-  const extraInfo = extraTurnedOff > 0 ? ` (+${extraTurnedOff} retry)` : "";
-  return `${prefixMessage}Activated scene "${sceneConfig.name}" - set ${lightsSet} lights${modeInfo}${ikeaInfo}${extraInfo}`;
+  return `${prefixMessage}Activated scene "${sceneConfig.name}" - requested ${entries.length} light states${exclusive ? " (exclusive)" : ""}.`;
 }
 
 async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
@@ -1792,7 +1405,7 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
     entity_id = `scene.${entity_id}`;
   }
 
-  validateEntityId(entity_id);
+  validateEntityId(entity_id, "scene");
 
   // Find the scene to get its config ID
   const scenes = await getScenes();
@@ -1808,7 +1421,9 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
   }
 
   // Get current config for the backup snapshot before deleting
+  requireOwned(configId);
   const existingConfig = await getSceneConfig(configId);
+  if (existingConfig) assertLightEntities(existingConfig.entities);
   const lightCount = existingConfig ? Object.keys(existingConfig.entities || {}).length : 0;
 
   // Save snapshot before deletion (for recovery)
@@ -1820,13 +1435,6 @@ async function handleDeleteScene(args: { entity_id: string }): Promise<string> {
 
   // Note: We keep the backup for potential recovery - mark as deleted but don't remove
   // This allows users to restore deleted scenes if needed
-  const backup = getSceneBackup(configId);
-  if (backup) {
-    // Keep the backup but we could add a deletedAt timestamp in the future
-    // For now, just remove from backup as before
-    removeSceneBackup(configId);
-  }
-
   return `Deleted scene "${entity_id}" (had ${lightCount} lights).`;
 }
 
@@ -1842,7 +1450,7 @@ async function handleUpdateScene(args: {
     entity_id = `scene.${entity_id}`;
   }
 
-  validateEntityId(entity_id);
+  validateEntityId(entity_id, "scene");
 
   // Find the existing scene
   const scenes = await getScenes();
@@ -1858,7 +1466,9 @@ async function handleUpdateScene(args: {
   }
 
   // Get existing scene config to preserve name and icon
+  requireOwned(configId);
   const existingConfig = await getSceneConfig(configId);
+  if (existingConfig) assertLightEntities(existingConfig.entities);
   if (!existingConfig) {
     return `Could not load config for scene "${entity_id}".`;
   }
@@ -1875,6 +1485,8 @@ async function handleUpdateScene(args: {
 
   // Get all lights from Home Assistant
   const allLights = await getLights();
+
+  if (entity_ids) for (const id of entity_ids) if (!allLights.some(l => l.entity_id === id && ["on", "off"].includes(l.state))) throw new Error(`Light ${id} is missing or unavailable`);
 
   // Determine which lights to capture as "on" with their current state
   let lightsOn: LightState[];
@@ -1932,7 +1544,7 @@ async function handleUpdateScene(args: {
   await saveSceneConfig(updatedConfig);
 
   // Update local backup
-  backupScene(configId, existingConfig.name, mode, entities);
+  backupScene(configId, existingConfig.name, mode, entities, updatedConfig.metadata?.dynamicBlackout === true);
 
   // Build informative summary
   const existingCount = Object.keys(existingEntities).length;
@@ -1963,7 +1575,7 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
   const { exclude = [], create_scene = false, user_confirmed } = args;
 
   // Safety check: require explicit user confirmation
-  if (!user_confirmed) {
+  if (user_confirmed !== true) {
     return "BLOCKED: Blackout requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested to turn off all lights.";
   }
 
@@ -1999,6 +1611,7 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
     );
 
     const sceneId = existingBlackout?.attributes.id || generateSceneId();
+    if (existingBlackout) { requireOwned(sceneId); const current = await getSceneConfig(sceneId); if (!current) throw new Error("Blackout config unavailable"); assertLightEntities(current.entities); }
 
     // Save with dynamic blackout marker - entities will be populated at activation time
     const sceneConfig: SceneConfig = {
@@ -2011,10 +1624,8 @@ async function handleBlackout(args: { exclude?: string[]; create_scene?: boolean
       },
     };
 
+    backupScene(sceneId, "Blackout", "exclusive", {}, true);
     await saveSceneConfig(sceneConfig);
-
-    // Backup locally
-    backupScene(sceneId, "Blackout", "exclusive", {});
 
     sceneMessage = `'Blackout' scene ${existingBlackout ? "updated" : "created"} (dynamic - will turn off ALL lights when activated). `;
   }
@@ -2128,7 +1739,7 @@ async function handleDiagnose(args: { test_connectivity?: boolean; user_confirme
     const issues: string[] = [];
     const missingLights: string[] = [];
     const removedLights: string[] = [];
-    const source = config?.metadata?.mode ? "mcp" : "external";
+    const source = configId && getSceneBackup(configId) ? "mcp" : "external";
     const mode = (config?.metadata?.mode as string) || "unknown";
 
     if (config?.entities) {
@@ -2302,286 +1913,78 @@ async function handleDiagnose(args: { test_connectivity?: boolean; user_confirme
   return report;
 }
 
-async function handleFix(args: {
-  action: "fix_all" | "fix_scene" | "test_scene" | "restore_from_backup";
-  scene_name?: string;
-  issues?: string[];
-  user_confirmed?: boolean;
-}): Promise<string> {
-  const { action, scene_name, issues, user_confirmed } = args;
-
-  if (action === "fix_all") {
-    const allLights = await getLights();
-    const allScenes = await getScenes();
-    const allLightIds = new Set(allLights.map((l) => l.entity_id));
-    let fixedCount = 0;
-    let fixReport = "KORJAUKSET:\n\n";
-
-    for (const scene of allScenes) {
-      const configId = scene.attributes.id;
-      if (!configId) continue;
-
-      const config = await getSceneConfig(configId);
-      if (!config) continue;
-
-      let modified = false;
-      const sceneName = scene.attributes.friendly_name || scene.entity_id;
-
-      // Fix null values
-      if (config.entities) {
-        for (const [entityId, entityConfig] of Object.entries(config.entities)) {
-          if (typeof entityConfig === "object" && entityConfig !== null) {
-            const cleanedConfig: Record<string, unknown> = {};
-            let hasNulls = false;
-
-            for (const [key, value] of Object.entries(entityConfig)) {
-              if (value !== null && value !== undefined) {
-                cleanedConfig[key] = value;
-              } else {
-                hasNulls = true;
-              }
-            }
-
-            if (hasNulls) {
-              config.entities[entityId] = cleanedConfig;
-              modified = true;
-            }
-          }
-        }
-
-        // Remove references to deleted lights
-        const sceneEntityIds = Object.keys(config.entities);
-        for (const entityId of sceneEntityIds) {
-          if (!allLightIds.has(entityId)) {
-            delete config.entities[entityId];
-            modified = true;
-            fixReport += `  ${sceneName}: poistettu ${entityId} (ei enää olemassa)\n`;
-          }
-        }
-
-        // Add missing lights to exclusive scenes
-        const mode = config.metadata?.mode;
-        if (mode === "exclusive") {
-          for (const light of allLights) {
-            if (!sceneEntityIds.includes(light.entity_id)) {
-              // Add new light with state "off"
-              config.entities[light.entity_id] = "off";
-              modified = true;
-              fixReport += `  ${sceneName}: lisätty ${light.attributes.friendly_name || light.entity_id} (state: off)\n`;
-            }
-          }
-        }
-      }
-
-      if (modified) {
-        await saveSceneConfig(config);
-        fixedCount++;
-      }
-    }
-
-    if (fixedCount === 0) {
-      return "Ei korjattavaa - kaikki scenet kunnossa!";
-    }
-
-    return `${fixReport}\nKorjattu ${fixedCount} sceneä.`;
-  }
-
-  if (action === "fix_scene") {
-    if (!scene_name) {
-      return "Error: scene_name required for fix_scene action";
-    }
-
-    const allScenes = await getScenes();
-    const scene = allScenes.find(
-      (s) => s.attributes.friendly_name?.toLowerCase() === scene_name.toLowerCase()
-    );
-
-    if (!scene) {
-      return `Scene "${scene_name}" not found.`;
-    }
-
-    const configId = scene.attributes.id;
-    if (!configId) {
-      return `Scene "${scene_name}" has no config ID - cannot fix.`;
-    }
-
-    const config = await getSceneConfig(configId);
-    if (!config) {
-      return `Could not load config for scene "${scene_name}".`;
-    }
-
-    const allLights = await getLights();
-    const allLightIds = new Set(allLights.map((l) => l.entity_id));
-    let changes: string[] = [];
-
-    if (config.entities) {
-      // Fix null values
-      for (const [entityId, entityConfig] of Object.entries(config.entities)) {
-        if (typeof entityConfig === "object" && entityConfig !== null) {
-          const cleanedConfig: Record<string, unknown> = {};
-          let hasNulls = false;
-
-          for (const [key, value] of Object.entries(entityConfig)) {
-            if (value !== null && value !== undefined) {
-              cleanedConfig[key] = value;
-            } else {
-              hasNulls = true;
-            }
-          }
-
-          if (hasNulls) {
-            config.entities[entityId] = cleanedConfig;
-            changes.push(`Poistettu null-arvot: ${entityId}`);
-          }
-        }
-      }
-
-      // Remove deleted lights
-      const sceneEntityIds = Object.keys(config.entities);
-      for (const entityId of sceneEntityIds) {
-        if (!allLightIds.has(entityId)) {
-          delete config.entities[entityId];
-          changes.push(`Poistettu: ${entityId} (ei enää olemassa)`);
-        }
-      }
-
-      // Add missing lights if exclusive
-      if (config.metadata?.mode === "exclusive") {
-        for (const light of allLights) {
-          if (!sceneEntityIds.includes(light.entity_id)) {
-            config.entities[light.entity_id] = "off";
-            changes.push(`Lisätty: ${light.attributes.friendly_name || light.entity_id} (off)`);
-          }
-        }
-      }
-    }
-
-    if (changes.length === 0) {
-      return `Scene "${scene_name}" - ei korjattavaa.`;
-    }
-
-    await saveSceneConfig(config);
-    return `Scene "${scene_name}" korjattu:\n${changes.map((c) => `  - ${c}`).join("\n")}`;
-  }
-
-  if (action === "test_scene") {
-    // Safety check: test_scene changes lights, requires confirmation
-    if (!user_confirmed) {
-      return "BLOCKED: test_scene changes light states and requires explicit user confirmation. Set user_confirmed=true only when user has explicitly requested to test this scene.";
-    }
-
-    if (!scene_name) {
-      return "Error: scene_name required for test_scene action";
-    }
-
-    const allScenes = await getScenes();
-    const scene = allScenes.find(
-      (s) => s.attributes.friendly_name?.toLowerCase() === scene_name.toLowerCase()
-    );
-
-    if (!scene) {
-      return `Scene "${scene_name}" not found.`;
-    }
-
-    // Activate the scene (already confirmed by user)
-    await handleActivateScene({ entity_id: scene.entity_id, user_confirmed: true });
-
-    if (issues && issues.length > 0) {
-      // User has reported issues - analyze and suggest fixes
-      let suggestions = `Raportoidut ongelmat scenelle "${scene_name}":\n\n`;
-
-      for (const issue of issues) {
-        suggestions += `  - ${issue}\n`;
-      }
-
-      suggestions += "\nMahdolliset korjaukset:\n";
-      suggestions += "  1. Päivitä scene nykyisellä valotilanteella: scene_update\n";
-      suggestions += "  2. Poista scene ja luo uudelleen: scene_delete + scene_create\n";
-      suggestions += "  3. Aja diagnostiikka: scene_diagnose\n";
-
-      return suggestions;
-    }
-
-    return `Scene "${scene_name}" aktivoitu. Tarkista valot ja kerro mikä meni pieleen (issues-parametri).`;
-  }
-
-  if (action === "restore_from_backup") {
-    const backups = getAllSceneBackups();
-    const allScenes = await getScenes();
-    const allLights = await getLights();
-    const allLightIds = new Set(allLights.map((l) => l.entity_id));
-
-    let restoreReport = "PALAUTUS VARMUUSKOPIOSTA:\n\n";
-    let restoredCount = 0;
-
-    // Filter backups to restore
-    const backupsToRestore: [string, LocalSceneBackup][] = [];
-
-    if (scene_name) {
-      // Restore specific scene by name
-      const entry = Object.entries(backups).find(
-        ([, backup]) => backup.name.toLowerCase() === scene_name.toLowerCase()
-      );
-      if (!entry) {
-        return `Scene "${scene_name}" not found in local backup.`;
-      }
-      backupsToRestore.push(entry);
+async function handleFix(args: { action: string; scene_name?: string; issues?: string[]; user_confirmed?: boolean; dry_run?: boolean }): Promise<string> {
+  const { action, scene_name } = args;
+  if (action === "import_scene" || action === "migrate_legacy") {
+    if (!scene_name) throw new Error("scene_name is required for explicit copy/migration");
+    let source: SceneConfig;
+    if (action === "migrate_legacy") {
+      // This unscoped file is never trusted automatically: select one named scene explicitly.
+      const legacy = JSON.parse(readFileSync(SCENES_BACKUP_FILE, "utf8")) as ScenesBackupStore;
+      if (legacy.version !== 1 || !legacy.scenes || typeof legacy.scenes !== "object") throw new Error("Invalid legacy backup");
+      const matches = Object.entries(legacy.scenes).filter(([, value]) => value.name === scene_name);
+      if (matches.length !== 1) throw new Error("Legacy scene name must match exactly one entry");
+      const [id, old] = matches[0];
+      source = { id, name: old.name, entities: old.entities, metadata: { mode: old.mode, dynamicBlackout: old.dynamicBlackout === true } };
     } else {
-      // Restore all missing scenes
-      for (const [sceneId, backup] of Object.entries(backups)) {
-        const existsInHA = allScenes.some((s) => s.attributes.id === sceneId);
-        if (!existsInHA) {
-          backupsToRestore.push([sceneId, backup]);
-        }
-      }
+      const matches = (await getScenes()).filter(scene => scene.attributes.friendly_name === scene_name);
+      if (matches.length !== 1 || !matches[0].attributes.id) throw new Error("Scene name must identify exactly one readable scene");
+      const current = await getSceneConfig(matches[0].attributes.id);
+      if (!current) throw new Error("Source scene config unavailable"); source = current;
     }
-
-    if (backupsToRestore.length === 0) {
-      return "Ei palautettavia scenejä - kaikki varmuuskopioidut scenet ovat jo HA:ssa.";
-    }
-
-    for (const [sceneId, backup] of backupsToRestore) {
-      // Update entities to match current system
-      // Remove lights that no longer exist, add new lights for exclusive mode
-      const updatedEntities: Record<string, Record<string, unknown> | string> = {};
-
-      for (const [entityId, entityConfig] of Object.entries(backup.entities)) {
-        if (allLightIds.has(entityId)) {
-          updatedEntities[entityId] = entityConfig;
-        }
-      }
-
-      // For exclusive mode, add any new lights as "off"
-      if (backup.mode === "exclusive") {
-        for (const light of allLights) {
-          if (!updatedEntities[light.entity_id]) {
-            updatedEntities[light.entity_id] = "off";
-          }
-        }
-      }
-
-      // Create scene config
-      const sceneConfig: SceneConfig = {
-        id: sceneId,
-        name: backup.name,
-        entities: updatedEntities,
-        metadata: {
-          mode: backup.mode,
-        },
-      };
-
-      await saveSceneConfig(sceneConfig);
-      restoredCount++;
-
-      const origCount = Object.keys(backup.entities).length;
-      const newCount = Object.keys(updatedEntities).length;
-      restoreReport += `  ✓ ${backup.name} palautettu (${origCount} → ${newCount} valoa)\n`;
-    }
-
-    return `${restoreReport}\nPalautettu ${restoredCount} sceneä.`;
+    if (!source.entities || typeof source.entities !== "object" || Array.isArray(source.entities)) throw new Error("Invalid source entities");
+    const lights = new Set((await getLights()).map(l => l.entity_id));
+    const entities = Object.fromEntries(Object.entries(source.entities).filter(([id]) => id.startsWith("light.") && lights.has(id)).map(([id, value]) => [id, typeof value === "string" ? value : normalizeLightConfig(value)]));
+    assertLightEntities(entities);
+    if (!Object.keys(entities).length && source.metadata?.dynamicBlackout !== true) throw new Error("Source has no existing lights to copy");
+    const newScene: SceneConfig = { id: generateSceneId(), name: `${source.name} (MCP copy)`, entities, metadata: { mode: source.metadata?.mode === "exclusive" ? "exclusive" : "additive", dynamicBlackout: source.metadata?.dynamicBlackout === true } };
+    const preview = `Create owned copy "${newScene.name}" with ${Object.keys(entities).length} lights; original remains unchanged.`;
+    if (args.dry_run !== false) return `PREVIEW: ${preview} Repeat with dry_run=false and user_confirmed=true to apply.`;
+    backupScene(newScene.id, newScene.name, newScene.metadata!.mode as "exclusive" | "additive", entities, newScene.metadata?.dynamicBlackout === true);
+    await saveSceneConfig(newScene); return preview;
   }
-
-  return "Unknown action";
+  if (action === "test_scene") {
+    if (!scene_name) throw new Error("scene_name required");
+    const scene = (await getScenes()).find(s => s.attributes.friendly_name === scene_name);
+    if (!scene) throw new Error("Scene not found");
+    if (args.dry_run !== false) return `PREVIEW: Activate scene "${scene_name}" (${scene.entity_id}). Repeat with dry_run=false and user_confirmed=true to activate.`;
+    return handleActivateScene({ entity_id: scene.entity_id, user_confirmed: true });
+  }
+  if (action === "restore_from_backup") {
+    const scenes = await getScenes();
+    const entries = Object.entries(getAllSceneBackups()).filter(([id, backup]) => scene_name ? backup.name === scene_name : !scenes.some(s => s.attributes.id === id));
+    const report: string[] = [];
+    for (const [id, backup] of entries) {
+      const existing = await getSceneConfig(id);
+      // Never overwrite an existing HA config during recovery, even an owned ID.
+      if (existing) { report.push(`Skipped existing scene ${backup.name}; use sync/update after review.`); continue; }
+      const scene: SceneConfig = { id, name: backup.name, entities: backup.entities, metadata: { mode: backup.mode, dynamicBlackout: backup.dynamicBlackout } };
+      assertLightEntities(scene.entities);
+      report.push(`Restore ${backup.name} (${Object.keys(backup.entities).length} lights)`);
+      if (args.dry_run === false) await saveSceneConfig(scene);
+    }
+    return `${args.dry_run !== false ? "PREVIEW: " : ""}${report.join("\n") || "No missing scenes to restore."}`;
+  }
+  const allLights = await getLights(); const available = new Set(allLights.map(l => l.entity_id));
+  const scenes = await getScenes(); const report: string[] = [];
+  if (action === "fix_scene" && !scene_name) throw new Error("scene_name required");
+  for (const scene of scenes) {
+    if (action === "fix_scene" && scene.attributes.friendly_name !== scene_name) continue;
+    const id = scene.attributes.id;
+    if (!id || !getSceneBackup(id)) { report.push(`Skipped external scene ${scene.entity_id}`); continue; }
+    const current = await getSceneConfig(id); if (!current) throw new Error("Owned scene config unavailable");
+    assertLightEntities(current.entities); // Mixed scenes are never repaired by deleting their other domains.
+    const entities = Object.fromEntries(Object.entries(current.entities).filter(([entity]) => available.has(entity)).map(([entity, value]) => [entity, typeof value === "string" ? value : normalizeLightConfig(Object.fromEntries(Object.entries(value).filter(([, v]) => v != null)))]));
+    if (current.metadata?.mode === "exclusive" && current.metadata?.dynamicBlackout !== true) for (const light of allLights) if (!entities[light.entity_id]) entities[light.entity_id] = "off";
+    if (hashConfig(entities) === hashConfig(current.entities)) continue;
+    report.push(`${current.name}: ${JSON.stringify(current.entities)} -> ${JSON.stringify(entities)}`);
+    if (args.dry_run === false) {
+      saveSceneSnapshot(id, current.name, current.entities, "update");
+      await saveSceneConfig({ ...current, entities });
+      backupScene(id, current.name, current.metadata?.mode === "additive" ? "additive" : "exclusive", entities, current.metadata?.dynamicBlackout === true);
+    }
+  }
+  return `${args.dry_run !== false ? "PREVIEW: " : ""}${report.join("\n") || "No repairs needed."}`;
 }
 
 // Sync backup from Home Assistant
@@ -2648,7 +2051,7 @@ function handleHistory(args: { scene_id?: string; limit?: number }): string {
 const server = new Server(
   {
     name: "home-assistant-mcp",
-    version: "1.0.0",
+    version: createRequire(import.meta.url)("../package.json").version,
   },
   {
     capabilities: {
@@ -2662,10 +2065,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools,
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
+export async function dispatchTool(name: string, input: unknown = {}) {
   try {
+    const args = validateArguments(name, input);
     let result: string;
 
     switch (name) {
@@ -2741,6 +2143,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     return {
       content: [{ type: "text", text: result }],
+      ...(/^(Error|BLOCKED):/.test(result) ? { isError: true } : {}),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2749,7 +2152,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+}
+server.setRequestHandler(CallToolRequestSchema, async request => dispatchTool(request.params.name, request.params.arguments));
 
 // Start server
 async function main() {
@@ -2765,7 +2169,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === fileURLToPath(import.meta.url)) main().catch((error) => {
   console.error("Fatal error:", error);
   process.exit(1);
 });
